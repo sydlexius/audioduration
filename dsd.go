@@ -51,7 +51,12 @@ func DSD(r io.ReadSeeker) (float64, error) {
 		return 0, err
 	}
 	dc.chunkSize = binary.LittleEndian.Uint64(buf8)
-	r.Seek(int64(dc.chunkSize-12), io.SeekCurrent)
+	if dc.chunkSize < 12 {
+		return 0, errors.New("invalid DSD chunk size")
+	}
+	if _, err := r.Seek(int64(dc.chunkSize-12), io.SeekCurrent); err != nil {
+		return 0, err
+	}
 	_, err = io.ReadFull(r, buf4)
 	if err != nil {
 		return 0, err

@@ -16,7 +16,9 @@ func AAC(r io.ReadSeeker) (float64, error) {
 	}
 
 	if string(buf[0:4]) == "ADIF" {
-		r.Seek(4, io.SeekStart)
+		if _, err := r.Seek(4, io.SeekStart); err != nil {
+			return 0, err
+		}
 		return parseADIF(r)
 	}
 
@@ -27,7 +29,9 @@ func AAC(r io.ReadSeeker) (float64, error) {
 		}
 	} else {
 		// rewind if not ID3
-		r.Seek(0, io.SeekStart)
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return 0, err
+		}
 	}
 
 	// Sampling frequencies per ADTS sampling_frequency_index

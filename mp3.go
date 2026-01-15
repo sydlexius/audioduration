@@ -30,7 +30,11 @@ const (
 // getSampleRate Lookup sample rate.
 // https://www.codeproject.com/Articles/8295/MPEG-Audio-Frame-Header#SamplingRate
 func getSampleRate(mpegVer, sampleRateIndex uint8) int {
-	var sampleRate int = 0
+	if sampleRateIndex > 2 {
+		return 0
+	}
+
+	var sampleRate int
 	switch mpegVer {
 	case mpeg2:
 		sampleRate = []int{22050, 24000, 16000}[sampleRateIndex]
@@ -45,6 +49,11 @@ func getSampleRate(mpegVer, sampleRateIndex uint8) int {
 // getBitRate Lookup bit rate.
 // https://www.codeproject.com/Articles/8295/MPEG-Audio-Frame-Header#Bitrate
 func getBitRate(mpegVer, layer, bitRateIndex uint8) int {
+	// Validate bitRateIndex to prevent array out of bounds
+	if bitRateIndex > 15 {
+		return 0
+	}
+
 	layerIdx := 0
 	switch layer {
 	case layerI:
@@ -122,7 +131,7 @@ func layerStr(layer uint8) string {
 }
 
 func modeStr(mode uint8) string {
-	var modeStr string = ""
+	var modeStr string
 	switch mode {
 	case 0b00:
 		modeStr = "Stereo"
@@ -139,21 +148,20 @@ func modeStr(mode uint8) string {
 // frameLength Calculate how many bytes in a frame. Notice the unit of bitRateK
 // is Kbps(= 1000bps).
 func frameLength(layer, padding uint8, samples, bitRateK, sampleRate int) int {
-	frameLen := float32(0)
+	var frameLen float64
 	switch layer {
 	case layerI:
-		frameLen = (12*float32(bitRateK*1000)/float32(sampleRate) + float32(padding)) * 4
+		frameLen = (12*float64(bitRateK*1000)/float64(sampleRate) + float64(padding)) * 4
 	case layerII, layerIII:
-		frameLen = float32(samples/8)*float32(bitRateK*1000)/float32(sampleRate) + float32(padding)
+		frameLen = float64(samples/8)*float64(bitRateK*1000)/float64(sampleRate) + float64(padding)
 	}
-	// fmt.Println(frameLen)
 	return int(frameLen)
 }
 
 // getSideInfoLen Lookup side info length
 // https://www.codeproject.com/Articles/8295/MPEG-Audio-Frame-Header#SideInfo
 func getSideInfoLen(mpegVer, mode uint8) int64 {
-	var sideInfoLen int64 = 0
+	var sideInfoLen int64
 	switch mode {
 	case stereo, jointStereo, dualChannel:
 		switch mpegVer {
@@ -189,19 +197,19 @@ type Xing struct {
 // https://www.codeproject.com/Articles/8295/MPEG-Audio-Frame-Header#VBRIHeader
 func parseVBRI(r io.ReadSeeker) (VBRI, error) {
 	var vbri VBRI
-	r.Seek(10, io.SeekCurrent)
+	if _, err := r.Seek(10, io.SeekCurrent); err != nil {
+		return vbri, err
+	}
 	buf4 := make([]byte, 4)
-	_, err := io.ReadFull(r, buf4)
-	if err != nil {
+	if _, err := io.ReadFull(r, buf4); err != nil {
 		return vbri, err
 	}
 	vbri.totalSize = binary.BigEndian.Uint32(buf4)
-	_, err = io.ReadFull(r, buf4)
-	if err != nil {
+	if _, err := io.ReadFull(r, buf4); err != nil {
 		return vbri, err
 	}
 	vbri.totalFrame = binary.BigEndian.Uint32(buf4)
-	return vbri, err
+	return vbri, nil
 }
 
 // parseXing Extract total frames in Xing header.
@@ -209,16 +217,14 @@ func parseVBRI(r io.ReadSeeker) (VBRI, error) {
 func parseXing(r io.ReadSeeker) (Xing, error) {
 	var xing Xing
 	buf4 := make([]byte, 4)
-	_, err := io.ReadFull(r, buf4)
-	if err != nil {
+	if _, err := io.ReadFull(r, buf4); err != nil {
 		return xing, err
 	}
 	xing.flags = binary.BigEndian.Uint32(buf4)
 	if (xing.flags & 0x1) == 0 {
 		return xing, errors.New("no frame info in Xing header")
 	}
-	_, err = io.ReadFull(r, buf4)
-	if err != nil {
+	if _, err := io.ReadFull(r, buf4); err != nil {
 		return xing, err
 	}
 	xing.totalFrame = binary.BigEndian.Uint32(buf4)
@@ -229,6 +235,10 @@ func parseXing(r io.ReadSeeker) (Xing, error) {
 // https://id3.org/id3v2.4.0-structure
 // http://fileformats.archiveteam.org/wiki/ID3#How_to_skip_past_an_ID3v2_segment
 func parseID3v2Length(headbuf []byte) (offset int64) {
+	// ID3v2 header must be at least 10 bytes
+	if len(headbuf) < 10 {
+		return 0
+	}
 	offset = 0
 	for i := 6; i < 10; i++ {
 		offset <<= 7
@@ -245,11 +255,10 @@ func parseID3v2Length(headbuf []byte) (offset int64) {
 func Mp3(r io.ReadSeeker) (float64, error) {
 	buf := make([]byte, 1)
 	id3v2headbuf := make([]byte, 10)
-	var err error = nil
+	var err error
 	preHead := false
-	var firstFrameStartPos uint32 = 0
-	// var frameCount uint32 = 0
-	var duration float64 = 0
+	var firstFrameStartPos uint32
+	var duration float64
 
 	// Jump over the ID3v2 tags before really deal with audio data.
 	_, err = io.ReadFull(r, id3v2headbuf)
@@ -264,7 +273,9 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 		firstFrameStartPos = uint32(len(id3v2headbuf)) + uint32(id3v2offset)
 	} else {
 		// no ID3v2 head
-		r.Seek(0, io.SeekStart)
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return 0, err
+		}
 	}
 	// Use loop to find pattern 1111 1111 111? ????
 	for {
@@ -330,18 +341,21 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 
 	// Jump 16-bit CRC after the 4 bytes MPEG header, if has
 	if protection == 0 {
-		r.Seek(2, io.SeekCurrent)
+		if _, err := r.Seek(2, io.SeekCurrent); err != nil {
+			return 0, err
+		}
 	}
 	// Jump side info bytes
 	if layer == layerIII {
-		r.Seek(getSideInfoLen(mpegVer, mode), io.SeekCurrent)
+		if _, err := r.Seek(getSideInfoLen(mpegVer, mode), io.SeekCurrent); err != nil {
+			return 0, err
+		}
 	}
 
-	totalFrame := uint32(0)
+	var totalFrame uint32
 
 	buf4 := make([]byte, 4)
-	_, err = io.ReadFull(r, buf4)
-	if err != nil {
+	if _, err = io.ReadFull(r, buf4); err != nil {
 		return 0, err
 	}
 	switch string(buf4) {

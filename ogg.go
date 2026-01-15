@@ -67,7 +67,9 @@ func parseIdentHdr(r io.ReadSeeker) (vorbisIdentHdr, error) {
 	vih.blocksize0 = buf[21] & 0x0F
 	vih.blocksize1 = (buf[21] & 0xF0) >> 4
 	vih.framingFlag = buf[22]
-	r.Seek(-23, io.SeekCurrent)
+	if _, err := r.Seek(-23, io.SeekCurrent); err != nil {
+		return vih, err
+	}
 	return vih, nil
 }
 
@@ -133,8 +135,12 @@ Mainloop:
 		if string(seg) == identHdr {
 			vih, err = parseIdentHdr(r)
 		}
-		r.Seek(-7, io.SeekCurrent)
-		r.Seek(dataSegSize, io.SeekCurrent)
+		if _, err = r.Seek(-7, io.SeekCurrent); err != nil {
+			break
+		}
+		if _, err = r.Seek(dataSegSize, io.SeekCurrent); err != nil {
+			break
+		}
 	}
 	if err != io.EOF {
 		return 0, err

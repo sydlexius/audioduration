@@ -28,6 +28,10 @@ func FLAC(r io.ReadSeeker) (float64, error) {
 		blockType := buf[0] & 0x7f
 		var blockSize uint32 = binary.BigEndian.Uint32(buf) & 0x00FFFFFF
 		if blockType == 0 { // Metadata block type is Streaminfo
+			// Streaminfo block must be at least 18 bytes
+			if blockSize < 18 {
+				return 0, errors.New("invalid FLAC streaminfo block size")
+			}
 			streamInfoBuf := make([]byte, blockSize)
 			_, err = io.ReadFull(r, streamInfoBuf)
 			if err != nil {

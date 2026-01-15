@@ -19,9 +19,11 @@ const (
 
 // Duration Get duration of specific music file type.
 func Duration(file io.ReadSeeker, filetype int) (float64, error) {
-	var d float64 = 0
-	var err error = nil
-	file.Seek(0, io.SeekStart)
+	var d float64
+	var err error
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
 	switch filetype {
 	case TypeFlac:
 		d, err = FLAC(file)
