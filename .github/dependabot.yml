@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - ci
+    open-pull-requests-limit: 5
+    groups:
+      # CodeQL sub-actions (init/analyze/autobuild) cross-check versions at
+      # runtime and must move in lockstep; group them so a bump never splits
+      # init and analyze across separate PRs (which fails with a config
+      # version-mismatch error).
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"

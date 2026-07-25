@@ -1,0 +1,47 @@
+version: "2"
+
+run:
+  timeout: 5m
+  allow-parallel-runners: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - bodyclose
+    - gosec
+    - noctx
+    - unconvert
+    - unparam
+    - wastedassign
+    - misspell
+    - revive
+  settings:
+    gosec:
+      excludes:
+        - G104  # Unhandled errors (too noisy for log.Fatal paths)
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+          arguments:
+            - disableStutteringCheck
+        - name: unexported-return
+          severity: warning
+    misspell:
+      locale: US
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
