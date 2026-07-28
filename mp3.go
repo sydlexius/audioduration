@@ -430,7 +430,6 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 	layer := hdr.layer
 	sampleRate := hdr.sampleRate
 	samplesPerFrame := hdr.samplesPerFrame
-	frameLen := hdr.frameLen
 
 	// Position the reader just past the 4-byte header, which is where the
 	// original single-pass scan left it and what the CRC / side-info /
@@ -472,14 +471,92 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 		}
 		totalFrame = x.totalFrame
 	default:
-		fSize, err := r.Seek(0, io.SeekEnd)
-		if err != nil {
-			return 0, err
-		}
-		audioDataSize := fSize - firstFramePos
-		totalFrame = uint32(audioDataSize / int64(frameLen))
+		// No Xing/VBRI header, so the frame count is not declared anywhere and
+		// must be counted. Dividing total size by the FIRST frame's length
+		// assumes every frame matches it, which is true only for CBR; for a
+		// variable-bitrate stream the error is unbounded and silent. It also
+		// counts the ID3v2 tag bytes as audio.
+		//
+		// Walking the chain is exact for both, and returns seconds directly
+		// because a VBR stream has no single samples-per-frame value to
+		// multiply a frame count by.
+		return walkFrameChain(r, firstFramePos)
 	}
 
 	duration = (float64(samplesPerFrame) / float64(sampleRate)) * float64(totalFrame)
 	return duration, nil
+}
+
+// walkFrameChain sums samplesPerFrame/sampleRate over every frame from startPos
+// to end of stream, which is the exact duration of a stream that declares no
+// frame count. It reads only frame headers -- it never decodes audio -- so the
+// cost is one seek-and-read per frame, not a decode.
+//
+// Frames are validated through the same parseFrameHeader the first-frame scan
+// uses, so both agree on what a frame is. On hitting bytes that do not decode,
+// the walk rescans forward for the next real frame rather than aborting: a
+// stream with garbage spliced mid-file still yields a duration for the audio
+// that is actually there. A frame whose length would not advance the cursor is
+// treated as end of stream, so a malformed file cannot spin here forever.
+func walkFrameChain(r io.ReadSeeker, startPos int64) (float64, error) {
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+
+	// Read the stream in blocks: per-frame Seek+Read syscalls dominate the cost
+	// otherwise, and a header is only 4 bytes.
+	const blockSize = 256 * 1024
+	block := make([]byte, blockSize)
+	var blockStart, blockLen int64 = -1, 0
+
+	// headerAt returns the 4 header bytes at absolute offset p, refilling the
+	// block window when p falls outside it.
+	headerAt := func(p int64) ([4]byte, bool) {
+		var b [4]byte
+		if p+4 > end {
+			return b, false
+		}
+		if blockStart < 0 || p < blockStart || p+4 > blockStart+blockLen {
+			if _, serr := r.Seek(p, io.SeekStart); serr != nil {
+				return b, false
+			}
+			n, rerr := io.ReadFull(r, block)
+			if n < 4 && rerr != nil {
+				return b, false
+			}
+			blockStart, blockLen = p, int64(n)
+		}
+		off := p - blockStart
+		copy(b[:], block[off:off+4])
+		return b, true
+	}
+
+	var seconds float64
+	pos := startPos
+	for pos < end {
+		b, ok := headerAt(pos)
+		if !ok {
+			break
+		}
+		h, valid := parseFrameHeader(b)
+		if !valid {
+			// Not a frame here. Scan forward for the next one rather than
+			// abandoning the rest of the stream.
+			next, _, ferr := findFirstFrame(r, pos+1)
+			if ferr != nil {
+				break
+			}
+			// findFirstFrame moved the reader, so the block window is stale.
+			blockStart, blockLen = -1, 0
+			pos = next
+			continue
+		}
+		if h.frameLen <= 0 {
+			break
+		}
+		seconds += float64(h.samplesPerFrame) / float64(h.sampleRate)
+		pos += int64(h.frameLen)
+	}
+	return seconds, nil
 }
