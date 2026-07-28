@@ -335,7 +335,7 @@ func TestAudioEndOffsetRejectsCorruptTrailerSizes(t *testing.T) {
 
 	// APE footer claiming a tag far larger than the file.
 	corrupt := append(append([]byte{}, audio...), makeAPEFooter(1<<30)...)
-	end, err := audioEndOffset(bytes.NewReader(corrupt))
+	end, _, err := audioEndOffset(bytes.NewReader(corrupt))
 	if err != nil {
 		t.Fatalf("audioEndOffset: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestAudioEndOffsetRejectsCorruptTrailerSizes(t *testing.T) {
 
 	// Lyrics3 terminator whose size digits are not digits at all.
 	bogus := append(append([]byte{}, audio...), []byte("ab!defLYRICS200")...)
-	end, err = audioEndOffset(bytes.NewReader(bogus))
+	end, _, err = audioEndOffset(bytes.NewReader(bogus))
 	if err != nil {
 		t.Fatalf("audioEndOffset: %v", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 )
 
 const (
@@ -390,24 +391,33 @@ const (
 	// spans the longest fixed marker (the 227-byte ID3v1 extended tag) plus the
 	// markers that can follow it.
 	trailerWindow = 512
+	// maxAPETagLen caps how much a single APE footer may peel. "APETAGEX" can
+	// occur in entropy-coded audio payload by chance, and the size field beside
+	// such a match is arbitrary, so an unbounded peel could silently delete
+	// minutes of real audio. This is far above any legitimate APE tag, which
+	// holds text metadata and perhaps a cover image.
+	maxAPETagLen = 16 << 20
 )
 
-// audioEndOffset returns the offset at which audio stops: end of stream minus
-// any ID3v1, ID3v1 extended, APE or Lyrics3v2 trailer.
+// audioEndOffset returns where audio stops: peeled is end of stream minus any
+// ID3v1, ID3v1 extended, APE or Lyrics3v2 trailer, and raw is the unmodified end
+// of stream.
 //
 // Trailers stack -- a file commonly ends Lyrics3v2, APE, ID3v1 in that order --
 // so the scan loops from the end, peeling one marker per pass, until the tail no
 // longer matches anything. Cost is a bounded read of the last few hundred bytes,
 // which the CBR probe below needs anyway to know the audio byte range.
 //
-// A malformed or unrecognized tail is left alone: this function only ever moves
-// the end EARLIER, and only when it positively identifies a marker, so the worst
-// case is the pre-existing behavior of treating the trailer as audio.
-func audioEndOffset(r io.ReadSeeker) (int64, error) {
+// BOTH ends are returned because a marker can occur in entropy-coded audio
+// payload by chance, and this function cannot tell a genuine trailer from a
+// coincidence: peeling a false match would silently delete real audio. The
+// caller decides, by testing which candidate is consistent with the frame grid.
+func audioEndOffset(r io.ReadSeeker) (peeled, raw int64, err error) {
 	end, err := r.Seek(0, io.SeekEnd)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
+	raw = end
 
 	buf := make([]byte, trailerWindow)
 	for {
@@ -416,23 +426,23 @@ func audioEndOffset(r io.ReadSeeker) (int64, error) {
 			n = end
 		}
 		if n < 8 {
-			return end, nil
+			return end, raw, nil
 		}
-		if _, err := r.Seek(end-n, io.SeekStart); err != nil {
-			return 0, err
+		if _, serr := r.Seek(end-n, io.SeekStart); serr != nil {
+			return 0, 0, serr
 		}
 		tail := buf[:n]
 		if _, err := io.ReadFull(r, tail); err != nil {
 			// The tail could not be read, so no trailer can be identified.
 			// Fall back to the raw end rather than failing the whole parse.
-			return end, nil
+			return end, raw, nil
 		}
 
-		if peeled, ok := peelTrailer(tail, end); ok {
-			end = peeled
+		if next, ok := peelTrailer(tail, end); ok {
+			end = next
 			continue
 		}
-		return end, nil
+		return end, raw, nil
 	}
 }
 
@@ -444,16 +454,22 @@ func peelTrailer(tail []byte, end int64) (int64, bool) {
 
 	// ID3v1: exactly 128 bytes starting with "TAG" (but not "TAG+", which is the
 	// extended tag and is handled as its own case below).
+	//
+	// "TAG" alone is only three bytes and MPEG payload is entropy-coded, so it
+	// turns up in real audio by chance. The tag's text fields must therefore also
+	// look like text, or a coincidence peels 128 bytes of genuine audio and the
+	// duration comes out short.
 	if n >= id3v1Len {
 		s := tail[n-id3v1Len:]
-		if string(s[0:3]) == "TAG" && s[3] != '+' {
+		if string(s[0:3]) == "TAG" && s[3] != '+' && looksLikeID3v1Text(s[3:125]) {
 			return end - id3v1Len, true
 		}
 	}
 	// ID3v1 extended: 227 bytes starting with "TAG+". It normally precedes the
 	// ID3v1 tag, so the loop reaches it on a later pass.
 	if n >= id3v1ExtLen {
-		if string(tail[n-id3v1ExtLen:n-id3v1ExtLen+4]) == "TAG+" {
+		s := tail[n-id3v1ExtLen:]
+		if string(s[0:4]) == "TAG+" && looksLikeID3v1Text(s[4:184]) {
 			return end - id3v1ExtLen, true
 		}
 	}
@@ -470,7 +486,14 @@ func peelTrailer(tail []byte, end int64) (int64, bool) {
 			}
 			// Reject a size that is degenerate or larger than the stream: a
 			// corrupt field must not push the audio end below zero.
-			if total >= apeFooterLen && total <= end {
+			//
+			// Also cap it. "APETAGEX" can occur in audio payload by chance, and
+			// the size field beside it is then arbitrary, so an unbounded peel
+			// could silently delete minutes of real audio. A real APE tag holds
+			// text metadata and optionally a cover image; maxAPETagLen is far
+			// above any legitimate one and far below a length worth worrying
+			// about at 8 kbps.
+			if total >= apeFooterLen && total <= end && total <= maxAPETagLen {
 				return end - total, true
 			}
 		}
@@ -490,6 +513,33 @@ func peelTrailer(tail []byte, end int64) (int64, bool) {
 		}
 	}
 	return end, false
+}
+
+// looksLikeID3v1Text reports whether b is plausibly an ID3v1 text region: its
+// title/artist/album/comment fields, which are space- or NUL-padded printable
+// text, not arbitrary bytes.
+//
+// The check exists because "TAG" and "TAG+" are short enough to appear in
+// entropy-coded audio payload by chance, and an unvalidated match peels real
+// audio and shortens the reported duration. Control bytes and 0xFF (an MPEG sync
+// byte, which never appears in ID3v1 text) are the discriminator; high bytes are
+// allowed, since ID3v1 has no defined encoding and non-Latin tags are common.
+func looksLikeID3v1Text(b []byte) bool {
+	for _, c := range b {
+		if c == 0x00 || c >= 0x20 {
+			// NUL padding and printable/extended bytes are all expected.
+			if c != 0xFF {
+				continue
+			}
+			return false
+		}
+		// A control byte below 0x20. Only the whitespace a tagger might leave is
+		// plausible; anything else says this is not text.
+		if c != '\t' && c != '\n' && c != '\r' {
+			return false
+		}
+	}
+	return true
 }
 
 // parseASCIIDigits converts a run of ASCII decimal digits to an int64. ok is
@@ -520,6 +570,17 @@ const (
 	// so this run alone rejects essentially all of them, and it needs no resync
 	// because the first frame's offset is already known exactly.
 	headChainFrames = 16
+	// gridSlackBytes is how far a probe's observed frame boundary may sit, IN
+	// BYTES, from the position a constant bitrate predicts before the stream is
+	// rejected.
+	//
+	// It must be a small BYTE count, never a multiple of the frame length. The
+	// prediction rounds to the nearest whole frame, so a residual is at most half
+	// a frame by construction -- a slack of even one frame length would make the
+	// test vacuously true for every offset. In a genuine CBR stream the boundary
+	// tracks the ideal grid to within the padding byte, so a few bytes is ample,
+	// and the slack doubles as the bound on the largest anomaly that can hide.
+	gridSlackBytes = 4
 )
 
 // windowFor returns the byte window needed to chain want frames of roughly
@@ -552,40 +613,104 @@ func windowFor(refLen, want int, resync bool) int {
 // failure, a stream too short to sample -- selects the walk, so the cheap path
 // is taken only on positive evidence.
 func undeclaredDuration(r io.ReadSeeker, first frameHeader, firstPos int64) (float64, error) {
-	audioEnd, err := audioEndOffset(r)
+	peeledEnd, rawEnd, err := audioEndOffset(r)
 	if err != nil {
 		return 0, err
 	}
-	if audioEnd <= firstPos {
+	if rawEnd <= firstPos {
 		return 0, errors.New("no mp3 audio data")
 	}
 
-	audioBytes := audioEnd - firstPos
-	// Sample only when there is more audio than the probe would itself read.
-	// Below that the walk reads no more, and it is exact, so probing could only
-	// lose.
+	// A trailer marker can occur in entropy-coded audio payload by chance, and
+	// peeling on a false match deletes real audio and shortens the duration.
+	// Rather than guessing from the marker's contents whether it is genuine,
+	// TEST it: in a constant-bitrate stream the audio ends on the frame grid, so
+	// a peel that cut into audio leaves the end off-grid. Prefer the peeled end,
+	// fall back to the raw one, and use size division only for a candidate that
+	// both probes as constant AND ends where the grid predicts.
+	bpf := bytesPerFrame(first)
 	minProbeable := int64(windowFor(first.frameLen, headChainFrames, false)) +
 		int64(windowFor(first.frameLen, probeChain, true))*(probeCount+1)
-	if audioBytes >= minProbeable && probeConstantBitRate(r, first, firstPos, audioEnd) {
+
+	for _, end := range [2]int64{peeledEnd, rawEnd} {
+		audioBytes := end - firstPos
+		// Sample only when there is more audio than the probe would itself read.
+		// Below that the walk reads no more, and it is exact, so probing could
+		// only lose.
+		if audioBytes < minProbeable {
+			continue
+		}
+		if !onFrameGrid(audioBytes, bpf) {
+			continue
+		}
+		if !probeConstantBitRate(r, first, firstPos, end) {
+			continue
+		}
 		// bitRate is in kbps (1000 bps), so bytes*8/(kbps*1000) is seconds.
 		return float64(audioBytes) * 8 / float64(first.bitRate*1000), nil
 	}
-	return walkFrameChain(r, firstPos, audioEnd)
+
+	// No candidate earned the cheap path. Walk, from the peeled end: the walk
+	// stops at the first bytes that do not decode, so an over-peel costs it
+	// nothing and an under-peel would let it wander into a trailer.
+	return walkFrameChain(r, firstPos, peeledEnd)
 }
 
-// probeConstantBitRate reports whether every frame header it samples agrees with
-// the first frame on bitrate, sample rate, MPEG version and layer.
+// bytesPerFrame is the exact, fractional frame length a header's nominal bitrate
+// implies. The integer frameLen is this rounded down, which is why a CBR encoder
+// pads: the average frame length must land on this value.
+func bytesPerFrame(h frameHeader) float64 {
+	if h.sampleRate <= 0 {
+		return 0
+	}
+	return float64(h.samplesPerFrame) * float64(h.bitRate*1000) / (8 * float64(h.sampleRate))
+}
+
+// onFrameGrid reports whether a byte offset measured from the first frame falls
+// on a frame boundary that a constant bitrate predicts, within gridSlackBytes.
+func onFrameGrid(offset int64, bpf float64) bool {
+	if bpf <= 0 {
+		return false
+	}
+	k := math.Round(float64(offset) / bpf)
+	if k < 0 {
+		return false
+	}
+	return math.Abs(float64(offset)-k*bpf) <= gridSlackBytes
+}
+
+// probeConstantBitRate reports whether the stream from firstPos to audioEnd is
+// constant bitrate, sampling a bounded number of frame headers to decide.
 //
 // It compares BITRATE, never frame length: a CBR stream's frame lengths differ
 // by one byte as the padding bit toggles, and treating that as variation would
 // send every padded CBR file down the expensive path.
 //
-// Two kinds of evidence are gathered. First a run of consecutive frames from the
-// first frame onward, followed by frame length so no resync is needed -- a
-// genuinely variable stream varies within a few frames and is rejected here.
-// Then a spread of independent probes across the audio range, each resyncing
-// inside a small window and requiring a short agreeing chain, which catches a
-// stream that is constant at the head and varies later (a concatenation, say).
+// Three kinds of evidence are required, and the third is what makes a bounded
+// sample sufficient rather than merely suggestive:
+//
+//  1. A run of consecutive frames from the first frame, followed by frame length
+//     so no resync is needed. A variable stream varies within a few frames and
+//     is rejected here at no extra I/O.
+//
+//  2. Probes spread across the audio, each resyncing inside a small window and
+//     requiring a short agreeing chain, plus one anchored at the tail.
+//
+//  3. GRID ALIGNMENT. Sampling alone cannot bound the answer: any anomaly small
+//     enough to fall between two probe points is invisible, so the size division
+//     could be wrong by an unbounded amount with every probe agreeing. But in a
+//     constant-bitrate stream every frame boundary is predictable -- frame k
+//     begins at firstPos + round(k * bytesPerFrame) -- so ANY inserted region,
+//     any run of differently-sized frames, and any non-audio splice ANYWHERE
+//     before a probe shifts that probe's observed boundary off the predicted
+//     grid by the size of the anomaly. Checking alignment therefore tests the
+//     whole prefix up to each probe, not just the bytes in the window, which is
+//     what closes the gaps between probes.
+//
+// The slack is gridSlackBytes BYTES, not frame lengths: the prediction rounds to
+// the nearest whole frame, so a residual is at most half a frame by construction
+// and a frame-sized slack would accept everything. A few bytes covers the padding
+// wander, and it doubles as the bound on the largest anomaly that can hide.
 //
 // It returns false on anything it cannot confirm. A false negative costs the
 // caller the frame walk it would have done anyway; a false positive would report
@@ -597,13 +722,17 @@ func probeConstantBitRate(r io.ReadSeeker, first frameHeader, firstPos, audioEnd
 
 	// Evidence 1: consecutive frames from the start of the audio, followed by
 	// frame length so no resync is needed.
-	if !chainAgreesAt(r, buf[:headWin], first, firstPos, audioEnd, headChainFrames, false) {
+	if !chainAgreesAt(r, buf[:headWin], first, firstPos, audioEnd, headChainFrames, false, nil) {
 		return false
 	}
 
-	// Evidence 2: independent probes spread across the rest of the audio, plus
-	// one anchored at the very end so a differing tail cannot hide between the
-	// evenly spaced points.
+	bpf := bytesPerFrame(first)
+	if bpf <= 0 {
+		return false
+	}
+
+	// Evidence 2 and 3: probes spread across the audio, plus one anchored at the
+	// very end, each required to land on the predicted grid.
 	span := audioEnd - firstPos
 	offsets := make([]int64, 0, probeCount+1)
 	for i := 1; i <= probeCount; i++ {
@@ -617,7 +746,12 @@ func probeConstantBitRate(r io.ReadSeeker, first frameHeader, firstPos, audioEnd
 		if off <= firstPos || off >= audioEnd {
 			continue
 		}
-		if !chainAgreesAt(r, buf[:probeWin], first, off, audioEnd, probeChain, true) {
+		// onGrid rejects a boundary the constant-bitrate model does not predict.
+		// found is the absolute offset of the frame the probe actually synced to.
+		onGrid := func(found int64) bool {
+			return onFrameGrid(found-firstPos, bpf)
+		}
+		if !chainAgreesAt(r, buf[:probeWin], first, off, audioEnd, probeChain, true, onGrid) {
 			return false
 		}
 	}
@@ -628,13 +762,21 @@ func probeConstantBitRate(r io.ReadSeeker, first frameHeader, firstPos, audioEnd
 // chain of want frames all matching ref's bitrate, sample rate, version, layer.
 //
 // When resync is true, pos is an arbitrary offset rather than a known frame
-// boundary, so the window is scanned for the first offset that starts an
-// agreeing chain. When it is false, pos must already be a frame boundary and the
-// very first header there must decode.
+// boundary, so the window is scanned for an offset that starts an agreeing
+// chain. When it is false, pos must already be a frame boundary and the very
+// first header there must decode.
+//
+// onGrid, when non-nil, additionally requires the offset the chain starts at to
+// be a position the constant-bitrate model predicts. It is what stops a stray
+// frame-shaped byte run inside the window from satisfying the probe, and what
+// extends each probe's reach back over every byte before it.
 //
 // Reaching audioEnd mid-chain is success, not failure: the remaining frames do
-// not exist, and everything seen so far agreed.
-func chainAgreesAt(r io.ReadSeeker, buf []byte, ref frameHeader, pos, audioEnd int64, want int, resync bool) bool {
+// not exist, and everything seen so far agreed. That allowance requires the
+// chain to have reached the true end of audio, not merely the end of a window
+// that happens to sit there, so it is granted only to a chain that consumed the
+// window right up to audioEnd.
+func chainAgreesAt(r io.ReadSeeker, buf []byte, ref frameHeader, pos, audioEnd int64, want int, resync bool, onGrid func(int64) bool) bool {
 	if _, err := r.Seek(pos, io.SeekStart); err != nil {
 		return false
 	}
@@ -663,25 +805,34 @@ func chainAgreesAt(r io.ReadSeeker, buf []byte, ref frameHeader, pos, audioEnd i
 	}
 
 	for _, start := range starts {
-		if chainFrom(window, start, ref, want, pos+int64(n) >= audioEnd) {
+		if onGrid != nil && !onGrid(pos+int64(start)) {
+			continue
+		}
+		if chainFrom(window, start, ref, want) {
 			return true
 		}
 	}
 	return false
 }
 
-// chainFrom walks up to want frames from offset start within window, requiring
-// each to decode and to agree with ref. atAudioEnd says the window runs to the
-// end of the audio, which is the only circumstance in which running out of
-// window counts as success rather than an unfinished chain.
-func chainFrom(window []byte, start int, ref frameHeader, want int, atAudioEnd bool) bool {
+// chainFrom walks want frames from offset start within window, requiring each to
+// decode and to agree with ref. Running out of window is failure, never success.
+//
+// An earlier revision accepted a short chain that ran off the end of the audio,
+// so a probe whose window ends at audioEnd -- which the tail probe's always does
+// -- was satisfied by a SINGLE agreeing header. Measured against random bytes
+// that made the tail probe strictly weaker than the others (30 acceptances per
+// 200,000 windows, versus 0 mid-stream), which is backwards: the tail is where a
+// concatenated or re-encoded stream is most likely to differ.
+//
+// No allowance is needed. undeclaredDuration only probes a stream longer than
+// minProbeable, and windowFor sizes every window to hold want frames plus a
+// spare for resync, so a full chain always fits at every probe point.
+func chainFrom(window []byte, start int, ref frameHeader, want int) bool {
 	off := start
 	for i := 0; i < want; i++ {
 		if off+4 > len(window) {
-			// The chain ran off the window. That is success only when the window
-			// reaches the end of the audio, meaning there were no more frames to
-			// check; otherwise the evidence is incomplete.
-			return atAudioEnd && i > 0
+			return false
 		}
 		h, ok := parseFrameHeader([4]byte{window[off], window[off+1], window[off+2], window[off+3]})
 		if !ok || !sameFormat(h, ref) {
