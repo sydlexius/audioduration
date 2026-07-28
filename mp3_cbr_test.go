@@ -353,3 +353,126 @@ func TestAudioEndOffsetRejectsCorruptTrailerSizes(t *testing.T) {
 		t.Fatalf("non-numeric Lyrics3 size moved the audio end to %d, want %d (unchanged)", end, len(bogus))
 	}
 }
+
+// The tests below are the fixed forms of defects found by an adversarial review
+// of the first CBR fast-path implementation. Each one reproduced a silently
+// wrong duration before the grid check, the chain-completion fix and the
+// verified trailer peel landed. They are the reason the fast path is trustworthy
+// rather than merely fast, so they must keep passing.
+
+// TestMp3AnomalyInProbeGapIsWalked is the sampling blind spot. The probes sample
+// six points, leaving five unexamined gaps; this fixture hides a bitrate change
+// entirely inside one of them, so every probe agrees and only grid alignment can
+// reject the stream. Before the grid check this reported +34.5s.
+func TestMp3AnomalyInProbeGapIsWalked(t *testing.T) {
+	const a, m, b = 12014, 900, 100
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx128, 128, a, false, 0),
+		makeFrames(bitrateIdx320, 320, m, false, 0),
+		makeFrames(bitrateIdx128, 128, b, false, 0),
+	}, nil)
+
+	got, _ := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(a+m+b))
+}
+
+// TestMp3LowBitrateRegionInGapIsWalked is the same defect at its worst measured
+// magnitude: a low-bitrate region hidden in a gap of a high-bitrate stream. The
+// size division reported 456.5s against a true 1044.9s, 56% short.
+func TestMp3LowBitrateRegionInGapIsWalked(t *testing.T) {
+	const a, m, b = 12000, 8000, 100
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx320, 320, a, false, 0),
+		makeFrames(bitrateIdx32, 32, m, false, 0),
+		makeFrames(bitrateIdx320, 320, b, false, 0),
+	}, nil)
+
+	got, _ := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(a+m+b))
+}
+
+// TestMp3MidFileID3v2TagNotCountedAsAudio covers non-audio spliced into an
+// otherwise uniform stream -- a concatenated second file, or a re-tag. Every
+// frame agrees on bitrate, so only grid alignment notices the tag's bytes are
+// not audio. Before the fix this added +3.3s regardless of where the tag sat.
+func TestMp3MidFileID3v2TagNotCountedAsAudio(t *testing.T) {
+	const total = 14000
+	for _, at := range []int{500, 5100, 13500} {
+		data := bytes.Join([][]byte{
+			makeID3v2Tag(make([]byte, 512)),
+			makeFrames(bitrateIdx128, 128, at, false, 0),
+			makeID3v2Tag(make([]byte, 65536)),
+			makeFrames(bitrateIdx128, 128, total-at, false, 0),
+		}, nil)
+
+		got, _ := measure(t, data)
+		assertDuration(t, got, nil, secondsFor(total))
+	}
+}
+
+// TestMp3StrayHeaderNearEndDoesNotFlipVerdict pins the chain-completion fix. The
+// tail probe's window always ends at the end of audio, so an implementation that
+// accepts a chain running off the window there is satisfied by ONE agreeing
+// header. A single planted 4-byte run -- the kind entropy-coded payload produces
+// by chance -- previously flipped this correctly-walked stream to +34.5s.
+func TestMp3StrayHeaderNearEndDoesNotFlipVerdict(t *testing.T) {
+	const head, tail = 12000, 900
+	base := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx128, 128, head, false, 0),
+		makeFrames(bitrateIdx320, 320, tail, false, 0),
+	}, nil)
+	want := secondsFor(head + tail)
+
+	clean, _ := measure(t, base)
+	assertDuration(t, clean, nil, want)
+
+	planted := append([]byte{}, base...)
+	copy(planted[len(planted)-200:], []byte{0xFF, 0xFB, bitrateIdx128 << 4, 0x00})
+	got, _ := measure(t, planted)
+	assertDuration(t, got, nil, want)
+}
+
+// TestMp3FalseTrailerMarkersInAudioAreNotPeeled covers the peel trusting its own
+// marker match. "TAG" and "APETAGEX" occur in audio payload by chance, and an
+// unverified peel deletes real audio and shortens the duration. The grid check
+// is what rejects a peel that cut into audio.
+func TestMp3FalseTrailerMarkersInAudioAreNotPeeled(t *testing.T) {
+	const frames = 12000
+	audio := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makePaddedCBRFrames(bitrateIdx128, 128, frames),
+	}, nil)
+	bare, _ := measure(t, audio)
+	assertDuration(t, bare, nil, secondsFor(frames))
+
+	cases := []struct {
+		name  string
+		build func([]byte) []byte
+	}{
+		{"TAG in audio", func(b []byte) []byte {
+			copy(b[len(b)-id3v1Len:], "TAG")
+			return b
+		}},
+		{"stacked TAG and TAG+", func(b []byte) []byte {
+			copy(b[len(b)-id3v1Len:], "TAG")
+			copy(b[len(b)-id3v1Len-id3v1ExtLen:], "TAG+")
+			return b
+		}},
+		{"false APE footer claiming 400000 bytes", func(b []byte) []byte {
+			copy(b[len(b)-apeFooterLen:], makeAPEFooter(400000))
+			return b
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := measure(t, tc.build(append([]byte{}, audio...)))
+			if got != bare {
+				t.Fatalf("false trailer marker changed the duration: %.6f bare, %.6f with (%.6fs of real audio lost)",
+					bare, got, bare-got)
+			}
+		})
+	}
+}

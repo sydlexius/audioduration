@@ -25,6 +25,9 @@ const (
 	bitrateIdx128 = 9
 	// bitrate index 14 in the same table is 320 kbps.
 	bitrateIdx320 = 14
+	// bitrate index 1 in the same table is 32 kbps, the lowest MPEG-1 Layer III
+	// rate. Paired with 320 it gives the widest legal ratio between two frames.
+	bitrateIdx32 = 1
 )
 
 // frameLenFor returns the byte length of one frame at the given kbps, matching
