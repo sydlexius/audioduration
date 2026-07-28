@@ -1,3 +1,3 @@
-module github.com/lizc2003/audioduration
+module github.com/sydlexius/audioduration
 
 go 1.24.2

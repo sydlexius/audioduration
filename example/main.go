@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/lizc2003/audioduration"
+	"github.com/sydlexius/audioduration"
 )
 
 func main() {
