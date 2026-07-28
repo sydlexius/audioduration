@@ -251,103 +251,203 @@ func parseID3v2Length(headbuf []byte) (offset int64) {
 	return
 }
 
+// minFrameLen is a sanity floor for a decoded frame length. The smallest legal
+// MPEG frame is a 32 kbps MPEG-2.5 Layer III frame at 8000 Hz, which is 288
+// bytes; 24 is a deliberately conservative floor that rejects the degenerate
+// lengths a false sync produces without risking a legitimate frame.
+const minFrameLen = 24
+
+// frameHeader is a decoded and validated 4-byte MPEG audio frame header.
+type frameHeader struct {
+	mpegVer         uint8
+	layer           uint8
+	protection      uint8
+	mode            uint8
+	bitRate         int
+	sampleRate      int
+	samplesPerFrame int
+	frameLen        int
+}
+
+// parseFrameHeader decodes the 4 bytes of an MPEG audio frame header and
+// reports whether they form a legal one. It is the single place that decides a
+// sync candidate is real, so a caller scanning for the first frame and a caller
+// walking the frame chain apply identical rules.
+//
+// ok is false when the sync word is absent or any decoded field is reserved or
+// illegal. That is a REJECTION, not an error: the byte run merely looked like a
+// header, which is expected inside tag payloads and filler.
+func parseFrameHeader(b [4]byte) (frameHeader, bool) {
+	var h frameHeader
+	// 1111 1111, 111B BCCD, EEEE FFGH, IIJJ KLMM
+	if b[0] != 0xFF || (b[1]>>5) != 0b111 {
+		return h, false
+	}
+	h.mpegVer = (b[1] >> 3) & 0b00011
+	h.layer = (b[1] & 0b00000110) >> 1
+	h.protection = b[1] & 0x1
+	h.mode = b[3] >> 6
+
+	bitRateIndex := b[2] >> 4
+	// Index 15 is reserved and index 0 means "free format", whose frame length
+	// is not derivable from the header. getBitRate maps both to 0.
+	h.bitRate = getBitRate(h.mpegVer, h.layer, bitRateIndex)
+	if h.bitRate == 0 {
+		return h, false
+	}
+	sampleFreqIndex := (b[2] >> 2) & 0b000011
+	h.sampleRate = getSampleRate(h.mpegVer, sampleFreqIndex)
+	if h.sampleRate == 0 {
+		return h, false
+	}
+	h.samplesPerFrame = getSamplesPerFrame(h.mpegVer, h.layer)
+	if h.samplesPerFrame == 0 {
+		return h, false
+	}
+	padding := (b[2] >> 1) & 0b0000001
+	h.frameLen = frameLength(h.layer, padding, h.samplesPerFrame, h.bitRate, h.sampleRate)
+	if h.frameLen < minFrameLen {
+		return h, false
+	}
+	return h, true
+}
+
+// readFrameHeaderAt reads 4 bytes at absolute offset pos and decodes them.
+// The reader is left at an unspecified position; callers seek explicitly.
+func readFrameHeaderAt(r io.ReadSeeker, pos int64) (frameHeader, bool) {
+	if _, err := r.Seek(pos, io.SeekStart); err != nil {
+		return frameHeader{}, false
+	}
+	var b [4]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return frameHeader{}, false
+	}
+	return parseFrameHeader(b)
+}
+
+// skipID3v2Tags advances past EVERY consecutive ID3v2 tag at the head of the
+// stream and returns the offset of the first byte after them.
+//
+// Skipping only the first tag lets the frame scan walk into a later tag's
+// payload, where embedded cover art supplies false syncs -- a JPEG APP0 marker
+// (FF E0) matches the 11-bit sync pattern exactly.
+func skipID3v2Tags(r io.ReadSeeker) (int64, error) {
+	var pos int64
+	head := make([]byte, 10)
+	for {
+		if _, err := r.Seek(pos, io.SeekStart); err != nil {
+			return 0, err
+		}
+		if _, err := io.ReadFull(r, head); err != nil {
+			// Fewer than 10 bytes remain, so no further tag can start here.
+			// Not an error: the frame scan reports the real problem.
+			return pos, nil
+		}
+		if string(head[0:3]) != "ID3" {
+			return pos, nil
+		}
+		tagLen := parseID3v2Length(head)
+		if tagLen <= 0 {
+			// A zero-length tag would spin this loop forever.
+			return pos + int64(len(head)), nil
+		}
+		pos += int64(len(head)) + tagLen
+	}
+}
+
+// findFirstFrame scans forward from startPos for the first byte offset holding
+// a real frame header, and returns that offset with the decoded header.
+//
+// A sync candidate is accepted only when it decodes legally AND the frame that
+// should follow it also decodes legally (or the stream ends there, which is the
+// last frame of a well-formed file). Requiring the chain is what rejects an
+// isolated run of frame-shaped bytes; on rejection the scan resumes at the very
+// next byte, never past it, so a real frame overlapping a false one is found.
+func findFirstFrame(r io.ReadSeeker, startPos int64) (int64, frameHeader, error) {
+	// Read in blocks rather than a byte at a time: a false sync can sit
+	// thousands of bytes before the first real frame.
+	const blockSize = 64 * 1024
+	block := make([]byte, blockSize)
+
+	pos := startPos
+	for {
+		if _, err := r.Seek(pos, io.SeekStart); err != nil {
+			return 0, frameHeader{}, err
+		}
+		n, err := io.ReadFull(r, block)
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			return 0, frameHeader{}, err
+		}
+		if n < 4 {
+			return 0, frameHeader{}, errors.New("no valid mp3 frame found")
+		}
+		for i := 0; i+4 <= n; i++ {
+			if block[i] != 0xFF {
+				continue
+			}
+			h, ok := parseFrameHeader([4]byte{block[i], block[i+1], block[i+2], block[i+3]})
+			if !ok {
+				continue
+			}
+			candidate := pos + int64(i)
+			// Require the successor frame to decode too. A stream that ends
+			// exactly at the candidate's frame boundary is accepted as the
+			// final frame.
+			_, nextOK := readFrameHeaderAt(r, candidate+int64(h.frameLen))
+			if !nextOK {
+				if end, serr := r.Seek(0, io.SeekEnd); serr == nil && candidate+int64(h.frameLen) >= end {
+					return candidate, h, nil
+				}
+				continue
+			}
+			return candidate, h, nil
+		}
+		if n < blockSize {
+			return 0, frameHeader{}, errors.New("no valid mp3 frame found")
+		}
+		// Overlap by 3 bytes so a header straddling the block boundary is seen.
+		pos += int64(n - 3)
+	}
+}
+
 // Mp3 Calculate mp3 files duration.
 func Mp3(r io.ReadSeeker) (float64, error) {
-	buf := make([]byte, 1)
-	id3v2headbuf := make([]byte, 10)
-	var err error
-	preHead := false
-	var firstFrameStartPos uint32
 	var duration float64
 
-	// Jump over the ID3v2 tags before really deal with audio data.
-	_, err = io.ReadFull(r, id3v2headbuf)
+	// Jump over EVERY ID3v2 tag before really dealing with audio data.
+	tagEnd, err := skipID3v2Tags(r)
 	if err != nil {
 		return 0, err
 	}
-	if string(id3v2headbuf[0:3]) == "ID3" {
-		id3v2offset := parseID3v2Length(id3v2headbuf)
-		if _, err := r.Seek(id3v2offset, io.SeekCurrent); err != nil {
-			return 0, err
-		}
-		firstFrameStartPos = uint32(len(id3v2headbuf)) + uint32(id3v2offset)
-	} else {
-		// no ID3v2 head
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return 0, err
-		}
-	}
-	// Use loop to find pattern 1111 1111 111? ????
-	for {
-		_, err = io.ReadFull(r, buf)
-		if err != nil {
-			return 0, err
-		}
-		if preHead && (buf[0]>>5) == 0b111 {
-			firstFrameStartPos--
-			break
-		} else {
-			preHead = false
-		}
-		if buf[0] == 0xFF {
-			preHead = true
-		}
-		firstFrameStartPos++
-	}
 
-	// 1111 1111, 111B BCCD, EEEE FFGH, IIJJ KLMM
-	//                     ^
-	//             buf[0]  |
-	//                     fp
-	//
-	mpegVer := (buf[0] >> 3) & 0b00011
-	layer := (buf[0] & 0b00000110) >> 1
-	protection := (buf[0] & 0x1)
-
-	_, err = io.ReadFull(r, buf)
+	// Find the first byte offset that holds a genuine, chaining frame header.
+	firstFramePos, hdr, err := findFirstFrame(r, tagEnd)
 	if err != nil {
 		return 0, err
 	}
-	// 1111 1111, 111B BCCD, EEEE FFGH, IIJJ KLMM
-	//                                ^
-	//                        buf[0]  |
-	//                                fp
-	bitRateIndex := buf[0] >> 4
-	bitRate := getBitRate(mpegVer, layer, bitRateIndex)
-	if bitRate == 0 {
-		return 0, errors.New("invalid bit rate")
-	}
-	sampleFreqIndex := (buf[0] >> 2) & 0b000011
-	sampleRate := getSampleRate(mpegVer, sampleFreqIndex)
-	if sampleRate == 0 {
-		return 0, errors.New("invalid sample rate")
-	}
-	padding := (buf[0] >> 1) & 0b0000001
-	samplesPerFrame := getSamplesPerFrame(mpegVer, layer)
-	frameLen := frameLength(layer, padding, samplesPerFrame, bitRate, sampleRate)
-	if frameLen == 0 {
-		return 0, errors.New("invalid frame length")
-	}
 
-	_, err = io.ReadFull(r, buf)
-	if err != nil {
+	mpegVer := hdr.mpegVer
+	layer := hdr.layer
+	sampleRate := hdr.sampleRate
+	samplesPerFrame := hdr.samplesPerFrame
+	frameLen := hdr.frameLen
+
+	// Position the reader just past the 4-byte header, which is where the
+	// original single-pass scan left it and what the CRC / side-info /
+	// Xing / VBRI bookkeeping below assumes.
+	if _, err := r.Seek(firstFramePos+4, io.SeekStart); err != nil {
 		return 0, err
 	}
-	// 1111 1111, 111B BCCD, EEEE FFGH, IIJJ KLMM
-	//                                           ^
-	//                                   buf[0]  |
-	//                                           fp
-	mode := buf[0] >> 6
 
 	// Jump 16-bit CRC after the 4 bytes MPEG header, if has
-	if protection == 0 {
+	if hdr.protection == 0 {
 		if _, err := r.Seek(2, io.SeekCurrent); err != nil {
 			return 0, err
 		}
 	}
 	// Jump side info bytes
 	if layer == layerIII {
-		if _, err := r.Seek(getSideInfoLen(mpegVer, mode), io.SeekCurrent); err != nil {
+		if _, err := r.Seek(getSideInfoLen(mpegVer, hdr.mode), io.SeekCurrent); err != nil {
 			return 0, err
 		}
 	}
@@ -376,7 +476,7 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 		if err != nil {
 			return 0, err
 		}
-		audioDataSize := fSize - int64(firstFrameStartPos)
+		audioDataSize := fSize - firstFramePos
 		totalFrame = uint32(audioDataSize / int64(frameLen))
 	}
 
