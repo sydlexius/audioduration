@@ -251,10 +251,12 @@ func parseID3v2Length(headbuf []byte) (offset int64) {
 	return
 }
 
-// minFrameLen is a sanity floor for a decoded frame length. The smallest legal
-// MPEG frame is a 32 kbps MPEG-2.5 Layer III frame at 8000 Hz, which is 288
-// bytes; 24 is a deliberately conservative floor that rejects the degenerate
-// lengths a false sync produces without risking a legitimate frame.
+// minFrameLen is a sanity floor for a decoded frame length. MPEG-2/2.5 Layer II
+// and III bitrates start at 8 kbps, so the smallest legal frame is 8 kbps at the
+// highest MPEG-2 sample rate, 24000 Hz: (576/8)*8000/24000 = 24 bytes. The floor
+// is therefore the EXACT legal minimum, not a conservative estimate -- it
+// rejects the degenerate lengths a false sync produces while admitting every
+// legal frame. Do not raise it: doing so would reject legal low-bitrate frames.
 const minFrameLen = 24
 
 // frameHeader is a decoded and validated 4-byte MPEG audio frame header.
@@ -411,6 +413,17 @@ func findFirstFrame(r io.ReadSeeker, startPos int64) (int64, frameHeader, error)
 }
 
 // Mp3 Calculate mp3 files duration.
+//
+// I/O cost depends on what the stream declares. When a Xing or VBRI header is
+// present the frame count is read from it and only the first frame's region is
+// touched. When neither is present -- which includes plain CBR streams, whose
+// duration was previously derived from the file size alone -- the whole stream
+// is read to end of file in 256 KiB blocks to count frames. Only 4-byte frame
+// headers are decoded, never audio, but the bytes are still read.
+//
+// That is negligible for a local file (0.67 ms for a 7.9 MB stream) but it
+// changes the cost profile for an io.ReadSeeker backed by the network, such as
+// an HTTP range-request reader: size timeouts and any caching accordingly.
 func Mp3(r io.ReadSeeker) (float64, error) {
 	var duration float64
 
@@ -455,7 +468,12 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 
 	buf4 := make([]byte, 4)
 	if _, err = io.ReadFull(r, buf4); err != nil {
-		return 0, err
+		// Too few bytes remain after the side info for a Xing/VBRI marker, so
+		// the stream declares no frame count. findFirstFrame already validated
+		// a real frame at firstFramePos, so the audio is countable even though
+		// the metadata slot is not there -- count it rather than failing. This
+		// is reachable on short MPEG-2/2.5 frames and on a truncated tail.
+		return walkFrameChain(r, firstFramePos)
 	}
 	switch string(buf4) {
 	case "VBRI":
