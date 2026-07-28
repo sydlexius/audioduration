@@ -1,0 +1,121 @@
+# Scheduled fuzz workflow
+#
+# Every Duration entry point parses UNTRUSTED BINARY INPUT: the consumer hands
+# it arbitrary files off a music library, including truncated downloads,
+# half-written files, and whatever a user dropped in a folder. The failure modes
+# worth guarding structurally are panic (an index derived from a length field),
+# hang (a non-advancing cursor in a resync or skip loop), and unbounded reads.
+#
+# These are not hypothetical here. PR #4's review found an unbounded trailer
+# peel that amplified reads 34.1x on a crafted tail, and a walk that returned a
+# zero duration with a nil error. Hand review caught those two; this target is
+# what keeps catching the next one.
+#
+# Convention follows sydlexius/stillwater's fuzz.yml: weekly cron plus manual
+# dispatch, a static matrix (self-documenting, and adding a target is an
+# intentional one-line PR rather than silent drift), a drift-check job that
+# fails when the matrix and the live Fuzz* set diverge, and corpus caching keyed
+# on go.sum so a dependency change does not replay inputs chosen against
+# different code.
+#
+# Schedule: Monday 05:00 UTC, offset from the Scorecard cron (Monday 01:30 UTC)
+# so the two weekly jobs do not compete for runner capacity.
+
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz-drift-check:
+    name: Fuzz matrix drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check fuzz matrix is current
+        run: |
+          live_file="$(mktemp)"
+          matrix_file="$(mktemp)"
+          trap 'rm -f "$live_file" "$matrix_file"' EXIT
+          grep -RhoE --include='*.go' '^func Fuzz[A-Za-z0-9_]+' . \
+            | awk '{print $2}' | sort -u > "$live_file"
+          # awk takes the last field of each match, which is the bare target
+          # name whether or not it is quoted. Do not write a literal example of
+          # a matrix entry in these comments: the grep below scans this whole
+          # file, so an example parses as a real entry and fails a correct
+          # matrix. (That happened; this comment is the fix.)
+          grep -Eo 'fuzz_func:[[:space:]]*"?Fuzz[A-Za-z0-9_]+' .github/workflows/fuzz.yml \
+            | awk '{ gsub(/"/, "", $NF); print $NF }' | sort -u > "$matrix_file"
+          missing="$(comm -23 "$live_file" "$matrix_file")"
+          extra="$(comm -13 "$live_file" "$matrix_file")"
+          if [ -n "$missing$extra" ]; then
+            echo "FAIL: fuzz matrix is out of sync with the live Fuzz* functions."
+            if [ -n "$missing" ]; then
+              echo "  Missing in matrix:"
+              echo "$missing" | awk '{ print "    " $0 }'
+            fi
+            if [ -n "$extra" ]; then
+              echo "  Extra in matrix (no live target):"
+              echo "$extra" | awk '{ print "    " $0 }'
+            fi
+            exit 1
+          fi
+          echo "OK: matrix set matches live fuzz targets."
+
+  fuzz:
+    name: Fuzz (${{ matrix.fuzz_func }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fuzz_func: FuzzDuration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Restore fuzz corpus and build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            testdata/fuzz/${{ matrix.fuzz_func }}
+          key: fuzz-corpus-${{ matrix.fuzz_func }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.fuzz_func }}-
+
+      - name: Run fuzz target (${{ matrix.fuzz_func }})
+        run: go test -fuzz=^${{ matrix.fuzz_func }}$ -fuzztime=120s -run=^$ .
+
+      - name: Upload crash corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.fuzz_func }}
+          path: testdata/fuzz/${{ matrix.fuzz_func }}
+          if-no-files-found: warn
+          retention-days: 90

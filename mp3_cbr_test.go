@@ -1,0 +1,566 @@
+package audioduration
+
+import (
+	"bytes"
+	"io"
+	"testing"
+)
+
+// These cover the constant-bitrate fast path: a stream with no Xing/VBRI header
+// whose frames all report one bitrate is measured by dividing its audio byte
+// range by that bitrate, which is exact, instead of walking every frame header
+// to end of file.
+//
+// The fixtures follow mp3_test.go's conventions -- MPEG-1 Layer III, 44100 Hz,
+// stereo, built in memory from synthetic headers over a zeroed payload.
+
+// countingReader wraps an io.ReadSeeker and records how many bytes were
+// actually read through it. Seeking is free, so this measures exactly the
+// quantity that matters to a caller whose reader is backed by slow storage: how
+// much of the file had to be pulled off disk.
+type countingReader struct {
+	r     io.ReadSeeker
+	bytes int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.bytes += int64(n)
+	return n, err
+}
+
+func (c *countingReader) Seek(offset int64, whence int) (int64, error) {
+	return c.r.Seek(offset, whence)
+}
+
+// measure runs Mp3 over data through a counting reader and returns the duration
+// and the bytes read.
+func measure(t *testing.T, data []byte) (float64, int64) {
+	t.Helper()
+	c := &countingReader{r: bytes.NewReader(data)}
+	d, err := Mp3(c)
+	if err != nil {
+		t.Fatalf("Mp3: %v", err)
+	}
+	return d, c.bytes
+}
+
+// makePaddedCBRFrames builds n constant-bitrate frames that use the padding bit
+// the way a real encoder does.
+//
+// At 128 kbps / 44100 Hz a frame is 417.959 bytes, which is not an integer, so
+// the encoder emits 417-byte frames and pads to 418 often enough for the average
+// to land on the nominal rate. That makes frame LENGTH vary within a stream that
+// is unambiguously constant BITRATE -- the exact trap a CBR check must not fall
+// into.
+func makePaddedCBRFrames(bitrateIdx uint8, kbps, n int) []byte {
+	const base = float64(testSamplesPerFrame) / 8
+	exact := base * float64(kbps*1000) / float64(testSampleRate)
+	whole := int(exact)
+	frac := exact - float64(whole)
+
+	var out []byte
+	acc := 0.0
+	for i := 0; i < n; i++ {
+		var padding uint8
+		length := whole
+		acc += frac
+		if acc >= 1 {
+			acc--
+			padding = 1
+			length++
+		}
+		f := make([]byte, length)
+		f[0] = 0xFF
+		f[1] = 0xFB
+		f[2] = bitrateIdx<<4 | padding<<1
+		f[3] = 0x00
+		out = append(out, f...)
+	}
+	return out
+}
+
+// makeID3v1Tag returns a 128-byte ID3v1 trailer.
+func makeID3v1Tag() []byte {
+	tag := make([]byte, id3v1Len)
+	copy(tag, "TAG")
+	copy(tag[3:], "a title")
+	return tag
+}
+
+// TestMp3CBRWithoutXingIsCheap is the regression test for the whole fix. A
+// constant-bitrate stream with no Xing header must be measured WITHOUT reading
+// the file, because a consumer caching durations across a large library relies
+// on a duration probe touching only a file's header region.
+//
+// The bound is an upper limit on bytes read, not an exact count, so an
+// implementation change that stays cheap does not have to update it -- but a
+// change that reverts to reading the whole stream fails loudly.
+func TestMp3CBRWithoutXingIsCheap(t *testing.T) {
+	const frames = 12000 // ~5 MB at 128 kbps, 313s of audio
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 4096)),
+		makePaddedCBRFrames(bitrateIdx128, 128, frames),
+	}, nil)
+
+	got, read := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(frames))
+
+	// 256 KiB leaves room for the 64 KiB first-frame scan block plus every
+	// probe window, while being a small fraction of the ~5 MB fixture. Reading
+	// the whole stream, as the frame walk does, is ~20x this.
+	const maxRead = 256 * 1024
+	if read > maxRead {
+		t.Fatalf("read %d bytes of a %d-byte CBR stream, want <= %d: the O(1) path was not taken",
+			read, len(data), maxRead)
+	}
+	// Guard the bound from the other side: if the fixture ever shrinks below
+	// the bound the assertion above proves nothing.
+	if int64(len(data)) < 4*maxRead {
+		t.Fatalf("fixture is %d bytes, too small for a %d-byte bound to be meaningful", len(data), maxRead)
+	}
+}
+
+// TestMp3CBRPaddedFramesStayCheap is the padding trap, checked at two bitrates
+// whose exact frame length is fractional: 417.959 bytes at 128 kbps and 1044.9
+// at 320. Frame LENGTH therefore alternates within each stream while the bitrate
+// never changes, so a check comparing length instead of bitrate would classify
+// every real CBR file as variable and read all of it.
+func TestMp3CBRPaddedFramesStayCheap(t *testing.T) {
+	const frames = 12000
+	cases := []struct {
+		name string
+		idx  uint8
+		kbps int
+	}{
+		{"128kbps", bitrateIdx128, 128},
+		{"320kbps", bitrateIdx320, 320},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := bytes.Join([][]byte{
+				makeID3v2Tag(make([]byte, 1024)),
+				makePaddedCBRFrames(tc.idx, tc.kbps, frames),
+			}, nil)
+
+			got, read := measure(t, data)
+			assertDuration(t, got, nil, secondsFor(frames))
+
+			const maxRead = 256 * 1024
+			if read > maxRead {
+				t.Fatalf("padded CBR stream read %d bytes, want <= %d: padding was misread as bitrate variation",
+					read, maxRead)
+			}
+		})
+	}
+}
+
+// TestMp3VBRWithoutXingStillWalks is the control that pins the v0.9.0 fix in
+// place. A genuinely variable stream must still be frame-counted, which means it
+// must still be read -- the cheap path must NOT claim it.
+func TestMp3VBRWithoutXingStillWalks(t *testing.T) {
+	const frames = 12000
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 1024)),
+		makeVBRFrames(vbrSpecs, frames),
+	}, nil)
+
+	got, read := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(frames))
+
+	// Size division here would report roughly 75% too long. Assert the walk
+	// actually happened, so a future change cannot pass the duration check by
+	// coincidence while skipping the walk.
+	if read < int64(len(data))/2 {
+		t.Fatalf("VBR stream read only %d of %d bytes: it was not frame-counted", read, len(data))
+	}
+}
+
+// TestMp3ConstantHeadVariableTailIsWalked covers the case the spread probes
+// exist for: a stream that is constant for its first thousands of frames and
+// changes bitrate only later, which a head-only check would misclassify as CBR
+// and then measure with the wrong divisor.
+func TestMp3ConstantHeadVariableTailIsWalked(t *testing.T) {
+	const head = 6000
+	const tail = 6000
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx128, 128, head, false, 0),
+		makeFrames(bitrateIdx320, 320, tail, false, 0),
+	}, nil)
+
+	got, _ := measure(t, data)
+	// Every frame carries 1152 samples regardless of bitrate, so the true
+	// duration is simply the total frame count.
+	assertDuration(t, got, nil, secondsFor(head+tail))
+}
+
+// TestMp3CBRIgnoresID3v1Trailer covers the trailer trap. Size division over the
+// whole file would count an ID3v1 tag's 128 bytes as audio; over a low-bitrate
+// stream a stacked APE + Lyrics3 + ID3v1 tail is seconds of phantom duration.
+// Growing the trailer must not move the duration at all.
+func TestMp3CBRIgnoresID3v1Trailer(t *testing.T) {
+	const frames = 12000
+	audio := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makePaddedCBRFrames(bitrateIdx128, 128, frames),
+	}, nil)
+
+	bare, _ := measure(t, audio)
+	tagged, read := measure(t, append(append([]byte{}, audio...), makeID3v1Tag()...))
+
+	assertDuration(t, tagged, nil, secondsFor(frames))
+	if bare != tagged {
+		t.Fatalf("ID3v1 trailer changed the duration: %.6f without, %.6f with", bare, tagged)
+	}
+	const maxRead = 256 * 1024
+	if read > maxRead {
+		t.Fatalf("trailer handling cost the fast path: read %d bytes, want <= %d", read, maxRead)
+	}
+}
+
+// TestMp3CBRIgnoresAPEAndLyrics3Trailers checks that stacked trailers peel. A
+// file commonly ends Lyrics3v2, then APE, then ID3v1, and only peeling all
+// three leaves the true audio range.
+func TestMp3CBRIgnoresAPEAndLyrics3Trailers(t *testing.T) {
+	const frames = 12000
+	audio := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makePaddedCBRFrames(bitrateIdx128, 128, frames),
+	}, nil)
+	bare, _ := measure(t, audio)
+
+	// Lyrics3v2: body, then a 6-digit ASCII size covering the body, then the
+	// terminator.
+	lyricsBody := append([]byte("LYRICSBEGIN"), make([]byte, 500)...)
+	lyrics := append(lyricsBody, []byte("000511LYRICS200")...)
+
+	// APE tag: 32-byte footer whose size field covers body + footer, no header
+	// flag set.
+	apeBody := make([]byte, 200)
+	ape := append(apeBody, makeAPEFooter(len(apeBody)+apeFooterLen)...)
+
+	data := bytes.Join([][]byte{audio, lyrics, ape, makeID3v1Tag()}, nil)
+
+	got, _ := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(frames))
+	if got != bare {
+		t.Fatalf("stacked trailers changed the duration: %.6f bare, %.6f with trailers", bare, got)
+	}
+}
+
+// makeAPEFooter builds a 32-byte APE tag footer declaring the given total size
+// (tag body plus this footer), with no header present.
+func makeAPEFooter(total int) []byte {
+	f := make([]byte, apeFooterLen)
+	copy(f, "APETAGEX")
+	putUint32LE(f[8:], 2000) // version
+	putUint32LE(f[12:], uint32(total))
+	putUint32LE(f[16:], 1) // item count
+	putUint32LE(f[20:], 0) // flags: no header
+	return f
+}
+
+func putUint32LE(b []byte, v uint32) {
+	b[0] = byte(v)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v >> 16)
+	b[3] = byte(v >> 24)
+}
+
+// TestMp3XingUnchangedByCBRPath confirms the Xing fast path is untouched: a
+// declared frame count still wins outright, and still costs only the head of the
+// file. The declared count deliberately disagrees with the frames present.
+func TestMp3XingUnchangedByCBRPath(t *testing.T) {
+	const present = 12000
+	const declared = 777
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx128, 128, present, true, declared),
+	}, nil)
+
+	got, read := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(declared))
+
+	const maxRead = 128 * 1024
+	if read > maxRead {
+		t.Fatalf("Xing path read %d bytes, want <= %d", read, maxRead)
+	}
+}
+
+// TestMp3ShortCBRStreamWalks pins the small-file rule: below the probe's own
+// I/O footprint there is nothing to save, so the exact walk is used. It must
+// still return the right answer.
+func TestMp3ShortCBRStreamWalks(t *testing.T) {
+	const frames = 8
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 64)),
+		makePaddedCBRFrames(bitrateIdx128, 128, frames),
+	}, nil)
+
+	got, read := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(frames))
+	if read == 0 {
+		t.Fatal("short stream read nothing")
+	}
+}
+
+// TestMp3GarbageMidStreamIsNotCBR covers a resync region. A run of non-frame
+// bytes spliced into an otherwise constant stream must not be measured by size
+// division, which would count the garbage as audio. The probes fail to chain
+// there, so the walk takes over and reports only the audio that is really
+// present.
+func TestMp3GarbageMidStreamIsNotCBR(t *testing.T) {
+	const head = 6000
+	const tail = 6000
+	garbage := bytes.Repeat([]byte{0x00}, 200*1024)
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx128, 128, head, false, 0),
+		garbage,
+		makeFrames(bitrateIdx128, 128, tail, false, 0),
+	}, nil)
+
+	got, _ := measure(t, data)
+	// Only the real frames count; the garbage contributes nothing. Size
+	// division over the full range would add the garbage's 200 KiB as ~12.8s.
+	assertDuration(t, got, nil, secondsFor(head+tail))
+}
+
+// TestAudioEndOffsetRejectsCorruptTrailerSizes pins the guard on the trailer
+// peeler's arithmetic: a size field larger than the stream must be ignored
+// rather than driving the audio end negative.
+func TestAudioEndOffsetRejectsCorruptTrailerSizes(t *testing.T) {
+	audio := makeFrames(bitrateIdx128, 128, 20, false, 0)
+
+	// APE footer claiming a tag far larger than the file.
+	corrupt := append(append([]byte{}, audio...), makeAPEFooter(1<<30)...)
+	end, _, err := audioEndOffset(bytes.NewReader(corrupt))
+	if err != nil {
+		t.Fatalf("audioEndOffset: %v", err)
+	}
+	if end != int64(len(corrupt)) {
+		t.Fatalf("corrupt APE size moved the audio end to %d, want %d (unchanged)", end, len(corrupt))
+	}
+
+	// Lyrics3 terminator whose size digits are not digits at all.
+	bogus := append(append([]byte{}, audio...), []byte("ab!defLYRICS200")...)
+	end, _, err = audioEndOffset(bytes.NewReader(bogus))
+	if err != nil {
+		t.Fatalf("audioEndOffset: %v", err)
+	}
+	if end != int64(len(bogus)) {
+		t.Fatalf("non-numeric Lyrics3 size moved the audio end to %d, want %d (unchanged)", end, len(bogus))
+	}
+}
+
+// The tests below are the fixed forms of defects found by an adversarial review
+// of the first CBR fast-path implementation. Each one reproduced a silently
+// wrong duration before the grid check, the chain-completion fix and the
+// verified trailer peel landed. They are the reason the fast path is trustworthy
+// rather than merely fast, so they must keep passing.
+
+// TestMp3AnomalyInProbeGapIsWalked is the sampling blind spot. The probes sample
+// six points, leaving five unexamined gaps; this fixture hides a bitrate change
+// entirely inside one of them, so every probe agrees and only grid alignment can
+// reject the stream. Before the grid check this reported +34.5s.
+func TestMp3AnomalyInProbeGapIsWalked(t *testing.T) {
+	const a, m, b = 12014, 900, 100
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx128, 128, a, false, 0),
+		makeFrames(bitrateIdx320, 320, m, false, 0),
+		makeFrames(bitrateIdx128, 128, b, false, 0),
+	}, nil)
+
+	got, _ := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(a+m+b))
+}
+
+// TestMp3LowBitrateRegionInGapIsWalked is the same defect at its worst measured
+// magnitude: a low-bitrate region hidden in a gap of a high-bitrate stream. The
+// size division reported 456.5s against a true 1044.9s, 56% short.
+func TestMp3LowBitrateRegionInGapIsWalked(t *testing.T) {
+	const a, m, b = 12000, 8000, 100
+	data := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx320, 320, a, false, 0),
+		makeFrames(bitrateIdx32, 32, m, false, 0),
+		makeFrames(bitrateIdx320, 320, b, false, 0),
+	}, nil)
+
+	got, _ := measure(t, data)
+	assertDuration(t, got, nil, secondsFor(a+m+b))
+}
+
+// TestMp3MidFileID3v2TagNotCountedAsAudio covers non-audio spliced into an
+// otherwise uniform stream -- a concatenated second file, or a re-tag. Every
+// frame agrees on bitrate, so only grid alignment notices the tag's bytes are
+// not audio. Before the fix this added +3.3s regardless of where the tag sat.
+func TestMp3MidFileID3v2TagNotCountedAsAudio(t *testing.T) {
+	const total = 14000
+	for _, at := range []int{500, 5100, 13500} {
+		data := bytes.Join([][]byte{
+			makeID3v2Tag(make([]byte, 512)),
+			makeFrames(bitrateIdx128, 128, at, false, 0),
+			makeID3v2Tag(make([]byte, 65536)),
+			makeFrames(bitrateIdx128, 128, total-at, false, 0),
+		}, nil)
+
+		got, _ := measure(t, data)
+		assertDuration(t, got, nil, secondsFor(total))
+	}
+}
+
+// TestMp3StrayHeaderNearEndDoesNotFlipVerdict pins the chain-completion fix. The
+// tail probe's window always ends at the end of audio, so an implementation that
+// accepts a chain running off the window there is satisfied by ONE agreeing
+// header. A single planted 4-byte run -- the kind entropy-coded payload produces
+// by chance -- previously flipped this correctly-walked stream to +34.5s.
+func TestMp3StrayHeaderNearEndDoesNotFlipVerdict(t *testing.T) {
+	const head, tail = 12000, 900
+	base := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makeFrames(bitrateIdx128, 128, head, false, 0),
+		makeFrames(bitrateIdx320, 320, tail, false, 0),
+	}, nil)
+	want := secondsFor(head + tail)
+
+	clean, _ := measure(t, base)
+	assertDuration(t, clean, nil, want)
+
+	planted := append([]byte{}, base...)
+	copy(planted[len(planted)-200:], []byte{0xFF, 0xFB, bitrateIdx128 << 4, 0x00})
+	got, _ := measure(t, planted)
+	assertDuration(t, got, nil, want)
+}
+
+// TestMp3FalseTrailerMarkersInAudioAreNotPeeled covers the peel trusting its own
+// marker match. "TAG" and "APETAGEX" occur in audio payload by chance, and an
+// unverified peel deletes real audio and shortens the duration. The grid check
+// is what rejects a peel that cut into audio.
+func TestMp3FalseTrailerMarkersInAudioAreNotPeeled(t *testing.T) {
+	const frames = 12000
+	audio := bytes.Join([][]byte{
+		makeID3v2Tag(make([]byte, 512)),
+		makePaddedCBRFrames(bitrateIdx128, 128, frames),
+	}, nil)
+	bare, _ := measure(t, audio)
+	assertDuration(t, bare, nil, secondsFor(frames))
+
+	cases := []struct {
+		name  string
+		build func([]byte) []byte
+	}{
+		{"TAG in audio", func(b []byte) []byte {
+			copy(b[len(b)-id3v1Len:], "TAG")
+			return b
+		}},
+		{"stacked TAG and TAG+", func(b []byte) []byte {
+			copy(b[len(b)-id3v1Len:], "TAG")
+			copy(b[len(b)-id3v1Len-id3v1ExtLen:], "TAG+")
+			return b
+		}},
+		{"false APE footer claiming 400000 bytes", func(b []byte) []byte {
+			copy(b[len(b)-apeFooterLen:], makeAPEFooter(400000))
+			return b
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := measure(t, tc.build(append([]byte{}, audio...)))
+			if got != bare {
+				t.Fatalf("false trailer marker changed the duration: %.6f bare, %.6f with (%.6fs of real audio lost)",
+					bare, got, bare-got)
+			}
+		})
+	}
+}
+
+// --- CodeRabbit PR #4 findings, pinned as regression tests ---------------
+//
+// Both were REPRODUCED before being fixed; the magnitudes below are measured,
+// not estimated. Neither was caught by the existing suite nor by a 6.27M-
+// execution fuzz run, because both require a crafted TRAILER that valid sample
+// files never contain.
+
+// A crafted tail of repeated trailer markers must not turn a bounded read into
+// a whole-file read many times over. Every recognized marker shrinks the end by
+// as little as 15 bytes (a Lyrics3v2 footer whose ASCII size reads "000000"),
+// and each pass re-reads a trailerWindow tail, so an uncapped loop amplified
+// reads 34.1x -- 20,471,517 bytes for a 600,000-byte input. That defeats the
+// bounded-read guarantee this parser exists to provide.
+func TestPeelLoopIsCapped(t *testing.T) {
+	data := bytes.Repeat([]byte("000000LYRICS200"), 40000)
+
+	c := &countingReader{r: bytes.NewReader(data)}
+	if _, _, err := audioEndOffset(c); err != nil {
+		t.Fatalf("audioEndOffset: %v", err)
+	}
+
+	// Generous bound: the cap admits at most maxPeels passes of trailerWindow
+	// bytes. Anything near the input size means the loop is unbounded again.
+	const maxAllowed = 64 * 1024
+	if c.bytes > maxAllowed {
+		t.Errorf("peel loop read %d bytes for a %d-byte input (%.1fx amplification); want <= %d",
+			c.bytes, len(data), float64(c.bytes)/float64(len(data)), maxAllowed)
+	}
+}
+
+// An UNCORROBORATED peel must never yield a zero duration on a file that has
+// audio. peelTrailer accepts any APE or Lyrics3v2 size satisfying total <= end,
+// so a footer whose size field spans the stream drives the peeled end to or
+// below the first frame. Walking to that end leaves nothing to traverse and
+// returns (0, nil) -- a SILENT ZERO, the worst outcome available, since a
+// caller cannot distinguish it from a genuinely empty stream and propagates it
+// as fact. Measured before the fix: a VBR stream read 0.000s with a nil error.
+//
+// The fixture must be VBR WITHOUT a Xing header: a declared-duration file never
+// reaches undeclaredDuration and a CBR file takes the grid fast path, so both
+// would make this test vacuous. Two earlier reproduction attempts failed for
+// exactly that reason.
+func TestOverPeelDoesNotSilentlyZero(t *testing.T) {
+	// SMALL ON PURPOSE. A Lyrics3v2 size field is 6 ASCII digits, so it cannot
+	// claim more than 999,999 bytes. The 12,000-frame fixture used elsewhere in
+	// this file is ~8.8 MB, where the claimed size lands far above the first
+	// frame and the over-peel never occurs -- the test would pass against the
+	// unfixed code, which is exactly what it did before this was noticed.
+	const frames = 300
+	audio := makeVBRFrames(vbrSpecs, frames)
+	if len(audio) > 999999 {
+		t.Fatalf("fixture is %d bytes; a 6-digit Lyrics3 size cannot span it, so the test would be vacuous", len(audio))
+	}
+
+	clean, err := Mp3(bytes.NewReader(audio))
+	if err != nil {
+		t.Fatalf("clean parse: %v", err)
+	}
+	if clean <= 0 {
+		t.Fatalf("fixture reports %.3f; the test would be vacuous", clean)
+	}
+
+	crafted := appendLyrics3Footer(audio, len(audio))
+
+	got, err := Mp3(bytes.NewReader(crafted))
+	if err != nil {
+		// An error is an acceptable outcome here; a silent zero is not.
+		return
+	}
+	if got == 0 {
+		t.Fatalf("silent zero: crafted trailer yielded 0 with a nil error (clean stream reads %.3f)", clean)
+	}
+	if got < clean*0.9 {
+		t.Errorf("crafted trailer truncated the duration to %.3f, want ~%.3f", got, clean)
+	}
+}
+
+// appendLyrics3Footer appends a Lyrics3v2 footer whose 6-digit ASCII size field
+// claims size bytes -- a footer asserting the entire preceding stream is tag.
+func appendLyrics3Footer(audio []byte, size int) []byte {
+	digits := make([]byte, 6)
+	for i, s := 5, size; i >= 0; i, s = i-1, s/10 {
+		digits[i] = byte('0' + s%10)
+	}
+	out := append(append([]byte{}, audio...), digits...)
+	return append(out, []byte("LYRICS200")...)
+}
