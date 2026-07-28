@@ -26,7 +26,7 @@ func FLAC(r io.ReadSeeker) (float64, error) {
 			break
 		}
 		blockType := buf[0] & 0x7f
-		var blockSize uint32 = binary.BigEndian.Uint32(buf) & 0x00FFFFFF
+		blockSize := binary.BigEndian.Uint32(buf) & 0x00FFFFFF
 		if blockType == 0 { // Metadata block type is Streaminfo
 			// Streaminfo block must be at least 18 bytes
 			if blockSize < 18 {

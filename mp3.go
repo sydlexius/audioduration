@@ -6,8 +6,6 @@ import (
 	"io"
 )
 
-type mp3Hdr uint32
-
 const (
 	mpeg1  = 0b11
 	mpeg2  = 0b10
@@ -54,7 +52,7 @@ func getBitRate(mpegVer, layer, bitRateIndex uint8) int {
 		return 0
 	}
 
-	layerIdx := 0
+	var layerIdx int
 	switch layer {
 	case layerI:
 		layerIdx = 0
@@ -110,39 +108,6 @@ func getSamplesPerFrame(mpegVer, layer uint8) int {
 		}
 	}
 	return samples
-}
-
-func mpegVerStr(mpegVer uint8) string {
-	mpegVerTable := map[uint8]string{
-		mpeg1:  "MPEG-1",
-		mpeg2:  "MPEG-2",
-		mpeg25: "MPEG-2.5",
-	}
-	return mpegVerTable[mpegVer]
-}
-
-func layerStr(layer uint8) string {
-	layerTable := map[uint8]string{
-		layerI:   "Layer I",
-		layerII:  "Layer II",
-		layerIII: "Layer III",
-	}
-	return layerTable[layer]
-}
-
-func modeStr(mode uint8) string {
-	var modeStr string
-	switch mode {
-	case 0b00:
-		modeStr = "Stereo"
-	case 0b01:
-		modeStr = "Joint stereo"
-	case 0b10:
-		modeStr = "Dual channel"
-	case 0b11:
-		modeStr = "Single channel"
-	}
-	return modeStr
 }
 
 // frameLength Calculate how many bytes in a frame. Notice the unit of bitRateK

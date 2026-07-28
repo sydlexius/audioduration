@@ -15,7 +15,7 @@ type audioTest struct {
 }
 
 func TestFLAC(t *testing.T) {
-	var sampleDuration float64 = 3.399365
+	sampleDuration := 3.399365
 	testFile := "samples/sample.flac"
 	file, err := os.Open(testFile)
 	if err != nil {
@@ -33,7 +33,7 @@ func TestFLAC(t *testing.T) {
 }
 
 func TestMp4(t *testing.T) {
-	var sampleDuration float64 = 3.413333
+	sampleDuration := 3.413333
 	testFile := "samples/sample.mp4"
 	file, err := os.Open(testFile)
 	if err != nil {
@@ -51,7 +51,7 @@ func TestMp4(t *testing.T) {
 }
 
 func TestM4a(t *testing.T) {
-	var sampleDuration float64 = 3.413333
+	sampleDuration := 3.413333
 	testFile := "samples/sample.m4a"
 	file, err := os.Open(testFile)
 	if err != nil {
@@ -112,7 +112,7 @@ func TestMp2(t *testing.T) {
 }
 
 func TestOgg(t *testing.T) {
-	var sampleDuration float64 = 6.104036
+	sampleDuration := 6.104036
 	// https://commons.wikimedia.org/wiki/File:Example.ogg
 	// https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg
 	testFile := "samples/example.ogg"
@@ -133,7 +133,7 @@ func TestOgg(t *testing.T) {
 
 func TestDSD(t *testing.T) {
 	// t.SkipNow()
-	var sampleDuration float64 = 1.4685
+	sampleDuration := 1.4685
 	testFile := "samples/sample.dsf"
 	file, err := os.Open(testFile)
 	if err != nil {
@@ -151,7 +151,7 @@ func TestDSD(t *testing.T) {
 }
 
 func TestAac(t *testing.T) {
-	var sampleDuration float64 = 2.020136
+	sampleDuration := 2.020136
 	testFile := "samples/sample.aac"
 	file, err := os.Open(testFile)
 	if err != nil {
@@ -169,7 +169,7 @@ func TestAac(t *testing.T) {
 }
 
 func TestWebM(t *testing.T) {
-	var sampleDuration float64 = 2.028
+	sampleDuration := 2.028
 	testFile := "samples/sample.webm"
 	file, err := os.Open(testFile)
 	if err != nil {

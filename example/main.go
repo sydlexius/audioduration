@@ -13,7 +13,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("close: %v", cerr)
+		}
+	}()
 
 	d, err := audioduration.Duration(f, audioduration.TypeMp3)
 	if err != nil {
