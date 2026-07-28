@@ -377,18 +377,349 @@ func findFirstFrame(r io.ReadSeeker, startPos int64) (int64, frameHeader, error)
 	}
 }
 
+// Trailer marker sizes. An MP3 can carry metadata AFTER the audio as well as
+// before it; those bytes are not audio and must be excluded from any byte-range
+// arithmetic, or the duration inflates by the trailer's size.
+const (
+	id3v1Len       = 128 // "TAG"        + 125 bytes
+	id3v1ExtLen    = 227 // "TAG+"       + 223 bytes, sits immediately before ID3v1
+	apeFooterLen   = 32  // "APETAGEX"   + version/size/count/flags/reserved
+	lyrics3End     = 9   // "LYRICS200", preceded by a 6-digit ASCII size
+	lyrics3SizeLen = 6
+	// trailerWindow is the tail slice examined per iteration. It comfortably
+	// spans the longest fixed marker (the 227-byte ID3v1 extended tag) plus the
+	// markers that can follow it.
+	trailerWindow = 512
+)
+
+// audioEndOffset returns the offset at which audio stops: end of stream minus
+// any ID3v1, ID3v1 extended, APE or Lyrics3v2 trailer.
+//
+// Trailers stack -- a file commonly ends Lyrics3v2, APE, ID3v1 in that order --
+// so the scan loops from the end, peeling one marker per pass, until the tail no
+// longer matches anything. Cost is a bounded read of the last few hundred bytes,
+// which the CBR probe below needs anyway to know the audio byte range.
+//
+// A malformed or unrecognized tail is left alone: this function only ever moves
+// the end EARLIER, and only when it positively identifies a marker, so the worst
+// case is the pre-existing behavior of treating the trailer as audio.
+func audioEndOffset(r io.ReadSeeker) (int64, error) {
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+
+	buf := make([]byte, trailerWindow)
+	for {
+		n := int64(trailerWindow)
+		if n > end {
+			n = end
+		}
+		if n < 8 {
+			return end, nil
+		}
+		if _, err := r.Seek(end-n, io.SeekStart); err != nil {
+			return 0, err
+		}
+		tail := buf[:n]
+		if _, err := io.ReadFull(r, tail); err != nil {
+			// The tail could not be read, so no trailer can be identified.
+			// Fall back to the raw end rather than failing the whole parse.
+			return end, nil
+		}
+
+		if peeled, ok := peelTrailer(tail, end); ok {
+			end = peeled
+			continue
+		}
+		return end, nil
+	}
+}
+
+// peelTrailer identifies at most one trailing metadata block at the end of tail
+// (whose last byte is at absolute offset end-1) and returns the new end offset.
+// ok is false when nothing is recognized, which terminates the peel loop.
+func peelTrailer(tail []byte, end int64) (int64, bool) {
+	n := int64(len(tail))
+
+	// ID3v1: exactly 128 bytes starting with "TAG" (but not "TAG+", which is the
+	// extended tag and is handled as its own case below).
+	if n >= id3v1Len {
+		s := tail[n-id3v1Len:]
+		if string(s[0:3]) == "TAG" && s[3] != '+' {
+			return end - id3v1Len, true
+		}
+	}
+	// ID3v1 extended: 227 bytes starting with "TAG+". It normally precedes the
+	// ID3v1 tag, so the loop reaches it on a later pass.
+	if n >= id3v1ExtLen {
+		if string(tail[n-id3v1ExtLen:n-id3v1ExtLen+4]) == "TAG+" {
+			return end - id3v1ExtLen, true
+		}
+	}
+	// APE tag: a 32-byte footer whose size field covers the tag body and the
+	// footer itself. Bit 31 of the flags means a 32-byte header precedes it too.
+	if n >= apeFooterLen {
+		f := tail[n-apeFooterLen:]
+		if string(f[0:8]) == "APETAGEX" {
+			size := int64(binary.LittleEndian.Uint32(f[12:16]))
+			flags := binary.LittleEndian.Uint32(f[20:24])
+			total := size
+			if flags&0x80000000 != 0 {
+				total += apeFooterLen
+			}
+			// Reject a size that is degenerate or larger than the stream: a
+			// corrupt field must not push the audio end below zero.
+			if total >= apeFooterLen && total <= end {
+				return end - total, true
+			}
+		}
+	}
+	// Lyrics3v2: ends with "LYRICS200" preceded by a 6-digit ASCII byte count
+	// covering the tag from "LYRICSBEGIN" up to but excluding those 15 bytes.
+	if n >= lyrics3End+lyrics3SizeLen {
+		if string(tail[n-lyrics3End:]) == "LYRICS200" {
+			digits := tail[n-lyrics3End-lyrics3SizeLen : n-lyrics3End]
+			size, ok := parseASCIIDigits(digits)
+			if ok {
+				total := size + lyrics3End + lyrics3SizeLen
+				if total <= end {
+					return end - total, true
+				}
+			}
+		}
+	}
+	return end, false
+}
+
+// parseASCIIDigits converts a run of ASCII decimal digits to an int64. ok is
+// false if any byte is not a digit, so a random byte run that happens to sit
+// before a "LYRICS200"-looking string is not acted on.
+func parseASCIIDigits(b []byte) (int64, bool) {
+	var v int64
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		v = v*10 + int64(c-'0')
+	}
+	return v, true
+}
+
+// Constant-bitrate probe tuning. Together these bound the probe's I/O to
+// probeCount+2 windows, each a small multiple of ONE frame length -- so the cost
+// scales with the bitrate, never with the file size.
+const (
+	// probeCount is how many points are sampled between the head and the tail.
+	probeCount = 5
+	// probeChain is how many consecutive frames one probe must decode, all
+	// agreeing, before that probe counts as confirming.
+	probeChain = 4
+	// headChainFrames is how many consecutive frames are checked from the first
+	// frame onward. A variable-bitrate stream varies within a handful of frames,
+	// so this run alone rejects essentially all of them, and it needs no resync
+	// because the first frame's offset is already known exactly.
+	headChainFrames = 16
+)
+
+// windowFor returns the byte window needed to chain want frames of roughly
+// refLen bytes. The slack covers the padding byte a CBR frame may carry, the
+// final header's 4 bytes, and -- when the window starts at an arbitrary offset
+// rather than a frame boundary -- one extra frame to resync within.
+func windowFor(refLen, want int, resync bool) int {
+	if refLen < minFrameLen {
+		refLen = minFrameLen
+	}
+	frames := want
+	if resync {
+		frames++
+	}
+	return frames*(refLen+1) + 4
+}
+
+// undeclaredDuration derives the duration of a stream that declares no frame
+// count, choosing between an O(1) size division and an exhaustive frame walk.
+//
+// Size division is EXACT for a constant-bitrate stream: audio bytes times 8
+// divided by the bitrate is the definition of constant bitrate, and it is
+// immune to the padding bit, which changes individual frame LENGTHS but not the
+// bitrate they encode -- CBR encoders alternate padding precisely so the average
+// frame length lands on the nominal rate. It is unboundedly wrong for a variable
+// bitrate stream, so it is used only when sampling finds no bitrate variation.
+//
+// The fallback is the frame walk, which is exact for both but reads the whole
+// audio range. Every inconclusive outcome -- an unreadable probe, a resync
+// failure, a stream too short to sample -- selects the walk, so the cheap path
+// is taken only on positive evidence.
+func undeclaredDuration(r io.ReadSeeker, first frameHeader, firstPos int64) (float64, error) {
+	audioEnd, err := audioEndOffset(r)
+	if err != nil {
+		return 0, err
+	}
+	if audioEnd <= firstPos {
+		return 0, errors.New("no mp3 audio data")
+	}
+
+	audioBytes := audioEnd - firstPos
+	// Sample only when there is more audio than the probe would itself read.
+	// Below that the walk reads no more, and it is exact, so probing could only
+	// lose.
+	minProbeable := int64(windowFor(first.frameLen, headChainFrames, false)) +
+		int64(windowFor(first.frameLen, probeChain, true))*(probeCount+1)
+	if audioBytes >= minProbeable && probeConstantBitRate(r, first, firstPos, audioEnd) {
+		// bitRate is in kbps (1000 bps), so bytes*8/(kbps*1000) is seconds.
+		return float64(audioBytes) * 8 / float64(first.bitRate*1000), nil
+	}
+	return walkFrameChain(r, firstPos, audioEnd)
+}
+
+// probeConstantBitRate reports whether every frame header it samples agrees with
+// the first frame on bitrate, sample rate, MPEG version and layer.
+//
+// It compares BITRATE, never frame length: a CBR stream's frame lengths differ
+// by one byte as the padding bit toggles, and treating that as variation would
+// send every padded CBR file down the expensive path.
+//
+// Two kinds of evidence are gathered. First a run of consecutive frames from the
+// first frame onward, followed by frame length so no resync is needed -- a
+// genuinely variable stream varies within a few frames and is rejected here.
+// Then a spread of independent probes across the audio range, each resyncing
+// inside a small window and requiring a short agreeing chain, which catches a
+// stream that is constant at the head and varies later (a concatenation, say).
+//
+// It returns false on anything it cannot confirm. A false negative costs the
+// caller the frame walk it would have done anyway; a false positive would report
+// a wrong duration, so the asymmetry is deliberate.
+func probeConstantBitRate(r io.ReadSeeker, first frameHeader, firstPos, audioEnd int64) bool {
+	headWin := windowFor(first.frameLen, headChainFrames, false)
+	probeWin := windowFor(first.frameLen, probeChain, true)
+	buf := make([]byte, max(headWin, probeWin))
+
+	// Evidence 1: consecutive frames from the start of the audio, followed by
+	// frame length so no resync is needed.
+	if !chainAgreesAt(r, buf[:headWin], first, firstPos, audioEnd, headChainFrames, false) {
+		return false
+	}
+
+	// Evidence 2: independent probes spread across the rest of the audio, plus
+	// one anchored at the very end so a differing tail cannot hide between the
+	// evenly spaced points.
+	span := audioEnd - firstPos
+	offsets := make([]int64, 0, probeCount+1)
+	for i := 1; i <= probeCount; i++ {
+		offsets = append(offsets, firstPos+span*int64(i)/int64(probeCount+1))
+	}
+	if tail := audioEnd - int64(probeWin); tail > firstPos {
+		offsets = append(offsets, tail)
+	}
+
+	for _, off := range offsets {
+		if off <= firstPos || off >= audioEnd {
+			continue
+		}
+		if !chainAgreesAt(r, buf[:probeWin], first, off, audioEnd, probeChain, true) {
+			return false
+		}
+	}
+	return true
+}
+
+// chainAgreesAt reads one window at pos, sized by the caller, and verifies a
+// chain of want frames all matching ref's bitrate, sample rate, version, layer.
+//
+// When resync is true, pos is an arbitrary offset rather than a known frame
+// boundary, so the window is scanned for the first offset that starts an
+// agreeing chain. When it is false, pos must already be a frame boundary and the
+// very first header there must decode.
+//
+// Reaching audioEnd mid-chain is success, not failure: the remaining frames do
+// not exist, and everything seen so far agreed.
+func chainAgreesAt(r io.ReadSeeker, buf []byte, ref frameHeader, pos, audioEnd int64, want int, resync bool) bool {
+	if _, err := r.Seek(pos, io.SeekStart); err != nil {
+		return false
+	}
+	n, err := io.ReadFull(r, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return false
+	}
+	// Never read past the end of audio into a trailer.
+	if limit := audioEnd - pos; int64(n) > limit {
+		n = int(limit)
+	}
+	if n < 4 {
+		return false
+	}
+	window := buf[:n]
+
+	starts := []int{0}
+	if resync {
+		starts = starts[:0]
+		for i := 0; i+4 <= n; i++ {
+			if window[i] != 0xFF {
+				continue
+			}
+			starts = append(starts, i)
+		}
+	}
+
+	for _, start := range starts {
+		if chainFrom(window, start, ref, want, pos+int64(n) >= audioEnd) {
+			return true
+		}
+	}
+	return false
+}
+
+// chainFrom walks up to want frames from offset start within window, requiring
+// each to decode and to agree with ref. atAudioEnd says the window runs to the
+// end of the audio, which is the only circumstance in which running out of
+// window counts as success rather than an unfinished chain.
+func chainFrom(window []byte, start int, ref frameHeader, want int, atAudioEnd bool) bool {
+	off := start
+	for i := 0; i < want; i++ {
+		if off+4 > len(window) {
+			// The chain ran off the window. That is success only when the window
+			// reaches the end of the audio, meaning there were no more frames to
+			// check; otherwise the evidence is incomplete.
+			return atAudioEnd && i > 0
+		}
+		h, ok := parseFrameHeader([4]byte{window[off], window[off+1], window[off+2], window[off+3]})
+		if !ok || !sameFormat(h, ref) {
+			return false
+		}
+		off += h.frameLen
+	}
+	return true
+}
+
+// sameFormat reports whether two frame headers describe the same constant
+// stream. Padding and the CRC bit are deliberately not compared: both legally
+// vary frame to frame within a single CBR stream.
+func sameFormat(a, b frameHeader) bool {
+	return a.bitRate == b.bitRate &&
+		a.sampleRate == b.sampleRate &&
+		a.mpegVer == b.mpegVer &&
+		a.layer == b.layer
+}
+
 // Mp3 Calculate mp3 files duration.
 //
-// I/O cost depends on what the stream declares. When a Xing or VBRI header is
-// present the frame count is read from it and only the first frame's region is
-// touched. When neither is present -- which includes plain CBR streams, whose
-// duration was previously derived from the file size alone -- the whole stream
-// is read to end of file in 256 KiB blocks to count frames. Only 4-byte frame
-// headers are decoded, never audio, but the bytes are still read.
+// I/O cost depends on what the stream declares.
 //
-// That is negligible for a local file (0.67 ms for a 7.9 MB stream) but it
-// changes the cost profile for an io.ReadSeeker backed by the network, such as
-// an HTTP range-request reader: size timeouts and any caching accordingly.
+//   - Xing or VBRI header present: the frame count is read from it and only the
+//     first frame's region is touched.
+//   - Neither header present, constant bitrate: a bounded set of frame headers
+//     is sampled across the stream (see probeConstantBitRate) and the duration
+//     comes from dividing the audio byte range by the bitrate, which is exact
+//     for CBR. Cost is a fixed handful of small windows regardless of file size.
+//   - Neither header present, variable bitrate: the whole stream is read to end
+//     of audio in 256 KiB blocks to count frames, because nothing in the file
+//     declares the length and no cheaper method is correct. Only 4-byte frame
+//     headers are decoded, never audio, but the bytes are still read.
+//
+// The last case is negligible for a local file but changes the cost profile for
+// an io.ReadSeeker backed by the network, such as an HTTP range-request reader:
+// size timeouts and any caching accordingly.
 func Mp3(r io.ReadSeeker) (float64, error) {
 	var duration float64
 
@@ -438,7 +769,7 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 		// a real frame at firstFramePos, so the audio is countable even though
 		// the metadata slot is not there -- count it rather than failing. This
 		// is reachable on short MPEG-2/2.5 frames and on a truncated tail.
-		return walkFrameChain(r, firstFramePos)
+		return undeclaredDuration(r, hdr, firstFramePos)
 	}
 	switch string(buf4) {
 	case "VBRI":
@@ -454,16 +785,9 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 		}
 		totalFrame = x.totalFrame
 	default:
-		// No Xing/VBRI header, so the frame count is not declared anywhere and
-		// must be counted. Dividing total size by the FIRST frame's length
-		// assumes every frame matches it, which is true only for CBR; for a
-		// variable-bitrate stream the error is unbounded and silent. It also
-		// counts the ID3v2 tag bytes as audio.
-		//
-		// Walking the chain is exact for both, and returns seconds directly
-		// because a VBR stream has no single samples-per-frame value to
-		// multiply a frame count by.
-		return walkFrameChain(r, firstFramePos)
+		// No Xing/VBRI header, so the frame count is declared nowhere and has to
+		// be derived from the audio itself.
+		return undeclaredDuration(r, hdr, firstFramePos)
 	}
 
 	duration = (float64(samplesPerFrame) / float64(sampleRate)) * float64(totalFrame)
@@ -481,12 +805,7 @@ func Mp3(r io.ReadSeeker) (float64, error) {
 // stream with garbage spliced mid-file still yields a duration for the audio
 // that is actually there. A frame whose length would not advance the cursor is
 // treated as end of stream, so a malformed file cannot spin here forever.
-func walkFrameChain(r io.ReadSeeker, startPos int64) (float64, error) {
-	end, err := r.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, err
-	}
-
+func walkFrameChain(r io.ReadSeeker, startPos, end int64) (float64, error) {
 	// Read the stream in blocks: per-frame Seek+Read syscalls dominate the cost
 	// otherwise, and a header is only 4 bytes.
 	const blockSize = 256 * 1024
