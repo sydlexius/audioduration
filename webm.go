@@ -44,7 +44,7 @@ func WebM(r io.ReadSeeker) (float64, error) {
 		case ebmlIdSegment:
 			// We'll scan until we find Info → Duration or reach end of this segment area.
 			segStart, _ := r.Seek(0, io.SeekCurrent)
-			segEnd := segStart + int64(size)
+			segEnd := segStart + int64(size) //nolint:gosec // reason: readElementHeader rejects any size > MaxInt64 before returning it, so this conversion is provably in range; G115 cannot carry that bound across the function boundary.
 
 			dur, err := readDurationInSegment(r, segEnd)
 			if err != nil {
@@ -60,7 +60,7 @@ func WebM(r io.ReadSeeker) (float64, error) {
 			}
 		default:
 			// Skip other top-level elements
-			if err := skipBytes(r, int64(size)); err != nil {
+			if err := skipBytes(r, int64(size)); err != nil { //nolint:gosec // reason: readElementHeader rejects any size > MaxInt64 before returning it, so this conversion is provably in range; G115 cannot carry that bound across the function boundary.
 				return 0, err
 			}
 		}
@@ -84,7 +84,7 @@ func readDurationInSegment(r io.ReadSeeker, segEnd int64) (float64, error) {
 		switch id {
 		case ebmlIdInfo:
 			infoStart, _ := r.Seek(0, io.SeekCurrent)
-			infoEnd := infoStart + int64(size)
+			infoEnd := infoStart + int64(size) //nolint:gosec // reason: readElementHeader rejects any size > MaxInt64 before returning it, so this conversion is provably in range; G115 cannot carry that bound across the function boundary.
 			d, err := readDurationInInfo(r, infoEnd)
 			if err != nil {
 				return 0, err
@@ -97,7 +97,7 @@ func readDurationInSegment(r io.ReadSeeker, segEnd int64) (float64, error) {
 				return 0, err
 			}
 		default:
-			if err := skipBytes(r, int64(size)); err != nil {
+			if err := skipBytes(r, int64(size)); err != nil { //nolint:gosec // reason: readElementHeader rejects any size > MaxInt64 before returning it, so this conversion is provably in range; G115 cannot carry that bound across the function boundary.
 				return 0, err
 			}
 		}
@@ -167,7 +167,7 @@ loop:
 				break loop
 			}
 		default:
-			if err := skipBytes(r, int64(size)); err != nil {
+			if err := skipBytes(r, int64(size)); err != nil { //nolint:gosec // reason: readElementHeader rejects any size > MaxInt64 before returning it, so this conversion is provably in range; G115 cannot carry that bound across the function boundary.
 				return 0, err
 			}
 		}
@@ -181,21 +181,32 @@ loop:
 }
 
 func readElementHeader(r io.Reader) (uint64, uint64, error) {
-	id, _, err := readVInt(r, false)
+	id, err := readVInt(r, false)
 	if err != nil {
 		return 0, 0, err
 	}
-	size, _, err := readVInt(r, true)
+	size, err := readVInt(r, true)
 	if err != nil {
 		return 0, 0, err
+	}
+	// size comes from the file, so a crafted element controls it fully. Every
+	// caller converts it to int64 to compute an absolute offset; a value above
+	// MaxInt64 would wrap negative there and seek backwards. Rejecting it once
+	// here covers all of them, so the conversions downstream are in range by
+	// construction.
+	if size > math.MaxInt64 {
+		return 0, 0, errors.New("invalid EBML element size")
 	}
 	return id, size, nil
 }
 
-func readVInt(r io.Reader, isMask bool) (uint64, int, error) {
+// readVInt reads an EBML variable-length integer. The encoded length is used
+// internally to size the read and the mask, but is not returned: neither caller
+// needs it.
+func readVInt(r io.Reader, isMask bool) (uint64, error) {
 	var firstByte [1]byte
 	if _, err := io.ReadFull(r, firstByte[:]); err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 
 	first := firstByte[0]
@@ -209,7 +220,7 @@ func readVInt(r io.Reader, isMask bool) (uint64, int, error) {
 	}
 
 	if length > 8 {
-		return 0, 0, fmt.Errorf("VINT length too long: %d", length)
+		return 0, fmt.Errorf("VINT length too long: %d", length)
 	}
 
 	val := uint64(first)
@@ -223,14 +234,14 @@ func readVInt(r io.Reader, isMask bool) (uint64, int, error) {
 			if err == io.ErrUnexpectedEOF {
 				err = io.EOF
 			}
-			return 0, 0, err
+			return 0, err
 		}
 		for _, b := range buf {
 			val = (val << 8) | uint64(b)
 		}
 	}
 
-	return val, length, nil
+	return val, nil
 }
 
 func skipBytes(r io.ReadSeeker, n int64) error {

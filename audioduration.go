@@ -44,6 +44,13 @@ func Duration(file io.ReadSeeker, filetype int) (float64, error) {
 	default:
 		err = fmt.Errorf("unsupported type: %d", filetype)
 	}
-	file.Seek(0, io.SeekStart)
+	// Rewind so the caller gets the reader back where they handed it over. A
+	// failure here leaves the reader at an undefined offset, which the caller
+	// cannot detect on its own, so it is reported rather than dropped -- but
+	// only when the parse itself succeeded, so a real parse error is never
+	// masked by a rewind error.
+	if _, serr := file.Seek(0, io.SeekStart); serr != nil && err == nil {
+		return d, serr
+	}
 	return d, err
 }

@@ -40,7 +40,7 @@ func AAC(r io.ReadSeeker) (float64, error) {
 		16000, 12000, 11025, 8000, 7350,
 	}
 
-	var sampleRate int = 0
+	var sampleRate int
 	var totalFrame = 0
 
 	// Find first sync word (0xFFF)
@@ -59,7 +59,7 @@ func AAC(r io.ReadSeeker) (float64, error) {
 		}
 
 		// Validate sync
-		if !(hdr[0] == 0xFF && (hdr[1]&0xF0) == 0xF0) {
+		if hdr[0] != 0xFF || (hdr[1]&0xF0) != 0xF0 {
 			// try to resync from next byte
 			if _, err := r.Seek(-6, io.SeekCurrent); err != nil {
 				return 0, err

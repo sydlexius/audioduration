@@ -1,7 +1,6 @@
 package audioduration
 
 import (
-	"bytes"
 	"encoding/binary"
 	"io"
 )
@@ -21,10 +20,7 @@ type oggPageHead struct {
 }
 
 func (oph oggPageHead) IsLastPage() bool {
-	if oph.headerType>>2 == 1 {
-		return true
-	}
-	return false
+	return oph.headerType>>2 == 1
 }
 
 const identHdr = "\x01vorbis"
@@ -43,6 +39,17 @@ type vorbisIdentHdr struct {
 	framingFlag     uint8
 }
 
+// readInt32LE decodes 4 little-endian bytes as a SIGNED 32-bit integer. The
+// Vorbis bitrate fields are signed and a negative value is legal -- it means the
+// field is unset -- so the full uint32 range must map onto the full int32 range.
+// The conversion is a deliberate reinterpretation of the same 32 bits, not a
+// narrowing one, so it cannot lose information and G115 does not apply.
+//
+//nolint:gosec // reason: intentional signed reinterpretation of a fixed-width field, not a narrowing conversion; the Vorbis spec defines these bitrates as signed.
+func readInt32LE(b []byte) int32 {
+	return int32(binary.LittleEndian.Uint32(b))
+}
+
 func parseIdentHdr(r io.ReadSeeker) (vorbisIdentHdr, error) {
 	var vih vorbisIdentHdr
 	buf := make([]byte, 23)
@@ -53,9 +60,12 @@ func parseIdentHdr(r io.ReadSeeker) (vorbisIdentHdr, error) {
 	vih.vorbisVersion = binary.LittleEndian.Uint32(buf[0:4])
 	vih.audioChannels = buf[4]
 	vih.audioSampleRate = binary.LittleEndian.Uint32(buf[5:9])
-	binary.Read(bytes.NewReader(buf[9:13]), binary.LittleEndian, &vih.bitrateMax)
-	binary.Read(bytes.NewReader(buf[13:17]), binary.LittleEndian, &vih.bitrateNom)
-	binary.Read(bytes.NewReader(buf[17:21]), binary.LittleEndian, &vih.bitrateMin)
+	// These replace three binary.Read calls whose errors were discarded: buf is
+	// already in memory and exactly 23 bytes, so they could not fail, but
+	// decoding the integer directly makes that structural rather than assumed.
+	vih.bitrateMax = readInt32LE(buf[9:13])
+	vih.bitrateNom = readInt32LE(buf[13:17])
+	vih.bitrateMin = readInt32LE(buf[17:21])
 	// Confused while reading sepecification whether blocksize_0 and blocksize_1
 	// is little endian or not, and which one occurs first. So just assume it
 	// according to the sample file's situation. It is processed as pattern below.
@@ -71,21 +81,6 @@ func parseIdentHdr(r io.ReadSeeker) (vorbisIdentHdr, error) {
 		return vih, err
 	}
 	return vih, nil
-}
-
-// getOggBitrate Get bitrate of OGG file. Reserved.
-func getOggBitrate(vih vorbisIdentHdr) int32 {
-	var bitrate int32
-	if vih.bitrateMax == 0 && vih.bitrateMin == 0 && vih.bitrateNom != 0 {
-		bitrate = vih.bitrateNom
-	}
-	if vih.bitrateMax == vih.bitrateMin && vih.bitrateMin == vih.bitrateNom {
-		bitrate = vih.bitrateNom
-	}
-	if vih.bitrateNom == 0 {
-		bitrate = (vih.bitrateMax + vih.bitrateMin) / 2
-	}
-	return bitrate
 }
 
 // Ogg Calculate ogg files duration.
@@ -133,7 +128,14 @@ Mainloop:
 			break
 		}
 		if string(seg) == identHdr {
-			vih, err = parseIdentHdr(r)
+			// The error was previously assigned and then overwritten unread by
+			// the Seek below, so a failure here silently left vih zeroed and
+			// the final duration divided by a zero sample rate. Break like
+			// every other read in this loop: a truncated stream yields io.EOF,
+			// which the check after the loop treats as a normal end.
+			if vih, err = parseIdentHdr(r); err != nil {
+				break
+			}
 		}
 		if _, err = r.Seek(-7, io.SeekCurrent); err != nil {
 			break

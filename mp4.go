@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 )
 
 // The specification of MP4 file could be get here.
@@ -26,10 +27,14 @@ func Mp4(r io.ReadSeeker) (float64, error) {
 			}
 			return 0, err
 		}
-		if size < headerLen {
+		// size comes from the file, so a crafted atom controls it fully. The
+		// first test rejects an underflowing subtraction; the second rejects a
+		// value that would wrap negative in the int64 conversion below and seek
+		// backwards.
+		if size < headerLen || size-headerLen > math.MaxInt64 {
 			return 0, errors.New("invalid MP4 atom size")
 		}
-		content := int64(size - headerLen)
+		content := int64(size - headerLen) //nolint:gosec // reason: the guard above rejects the underflow (size < headerLen) and every value whose int64 conversion would wrap (> MaxInt64), so this is provably in range; G115 cannot track the bound across the subtraction.
 
 		switch typ {
 		case "moov":
@@ -42,12 +47,15 @@ func Mp4(r io.ReadSeeker) (float64, error) {
 				if err != nil {
 					return 0, err
 				}
-				if childSize < childHdrLen {
+				// Same reasoning as the parent atom above: reject both the
+				// underflowing subtraction and the value that would wrap
+				// negative in the int64 conversion.
+				if childSize < childHdrLen || childSize-childHdrLen > math.MaxInt64 {
 					return 0, errors.New("invalid MP4 child atom size")
 				}
 				// compute end of this child box to realign after parsing its content
 				tmp, _ = r.Seek(0, io.SeekCurrent)
-				childEnd := tmp + int64(childSize-childHdrLen)
+				childEnd := tmp + int64(childSize-childHdrLen) //nolint:gosec // reason: the guard above rejects the underflow (childSize < childHdrLen) and every value whose int64 conversion would wrap (> MaxInt64), so this is provably in range; G115 cannot track the bound across the subtraction.
 
 				switch childTyp {
 				case "mvhd":
@@ -96,8 +104,8 @@ func Mp4(r io.ReadSeeker) (float64, error) {
 func readAudioDurationInTrak(r io.ReadSeeker, endPos int64, movieTS uint64) (float64, bool, error) {
 	var dur float64 = 0
 	var elstSecs float64 = 0
-	var haveMdhd bool = false
-	var haveElst bool = false
+	var haveMdhd bool
+	var haveElst bool
 
 	for {
 		typ, size, headerLen, err := readAtomHeader(r)
@@ -107,10 +115,10 @@ func readAudioDurationInTrak(r io.ReadSeeker, endPos int64, movieTS uint64) (flo
 			}
 			return 0, false, err
 		}
-		if size < headerLen {
+		if size < headerLen || size-headerLen > math.MaxInt64 {
 			return 0, false, errors.New("invalid MP4 atom size in trak")
 		}
-		content := int64(size - headerLen)
+		content := int64(size - headerLen) //nolint:gosec // reason: the guard above rejects the underflow (size < headerLen) and every value whose int64 conversion would wrap (> MaxInt64), so this is provably in range; G115 cannot track the bound across the subtraction.
 		tmp, _ := r.Seek(0, io.SeekCurrent)
 		childEnd := tmp + content
 
@@ -177,11 +185,11 @@ func readMdiaInfo(r io.ReadSeeker, endPos int64) (isAudio bool, ts uint64, dur u
 			err = e
 			return
 		}
-		if size < headerLen {
+		if size < headerLen || size-headerLen > math.MaxInt64 {
 			err = errors.New("invalid MP4 atom size in mdia")
 			return
 		}
-		content := int64(size - headerLen)
+		content := int64(size - headerLen) //nolint:gosec // reason: the guard above rejects the underflow (size < headerLen) and every value whose int64 conversion would wrap (> MaxInt64), so this is provably in range; G115 cannot track the bound across the subtraction.
 		tmp, _ := r.Seek(0, io.SeekCurrent)
 		childEnd := tmp + content
 
@@ -273,11 +281,11 @@ func readElstSeconds(r io.ReadSeeker, endPos int64, movieTS uint64) (float64, bo
 		if err != nil {
 			return 0, false, err
 		}
-		if size < headerLen {
+		if size < headerLen || size-headerLen > math.MaxInt64 {
 			err = errors.New("invalid MP4 atom size in edts")
 			return 0, false, err
 		}
-		content := int64(size - headerLen)
+		content := int64(size - headerLen) //nolint:gosec // reason: the guard above rejects the underflow (size < headerLen) and every value whose int64 conversion would wrap (> MaxInt64), so this is provably in range; G115 cannot track the bound across the subtraction.
 		tmp, _ := r.Seek(0, io.SeekCurrent)
 		childEnd := tmp + content
 
@@ -297,7 +305,7 @@ func readElstSeconds(r io.ReadSeeker, endPos int64, movieTS uint64) (float64, bo
 			var totalDur uint64 = 0
 
 			for i := uint32(0); i < entryCount; i++ {
-				var segDur uint64 = 0
+				var segDur uint64
 				if version == 1 {
 					b8 := make([]byte, 8)
 					if _, err := io.ReadFull(r, b8); err != nil {
