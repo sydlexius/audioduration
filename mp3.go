@@ -420,7 +420,20 @@ func audioEndOffset(r io.ReadSeeker) (peeled, raw int64, err error) {
 	raw = end
 
 	buf := make([]byte, trailerWindow)
-	for {
+	// BOUND THE PEEL. Every recognized marker shrinks end by at least 15 bytes
+	// (a Lyrics3v2 footer whose ASCII size field reads "000000"), and each pass
+	// re-reads a trailerWindow-sized tail. An unbounded loop therefore turns a
+	// crafted tail of repeated markers into a whole-file read many times over:
+	// measured at 34.1x -- 20,471,517 bytes read for a 600,000-byte input --
+	// which defeats the bounded-read guarantee this parser exists to provide.
+	//
+	// A real file stacks at most Lyrics3v2 + APE + ID3v1 extended + ID3v1, so a
+	// handful of passes covers every legitimate arrangement with room to spare.
+	// Hitting the cap means the tail is pathological, and stopping there simply
+	// leaves end where it is -- the same conservative outcome as an
+	// unrecognized marker.
+	const maxPeels = 8
+	for range maxPeels {
 		n := int64(trailerWindow)
 		if n > end {
 			n = end
@@ -444,6 +457,11 @@ func audioEndOffset(r io.ReadSeeker) (peeled, raw int64, err error) {
 		}
 		return end, raw, nil
 	}
+	// The cap was exhausted with a marker still matching on every pass, which no
+	// legitimate file produces. Return the end reached so far: the caller still
+	// tests both candidates against the frame grid, so an over-peeled end from a
+	// pathological tail is rejected there rather than trusted here.
+	return end, raw, nil
 }
 
 // peelTrailer identifies at most one trailing metadata block at the end of tail
@@ -650,10 +668,30 @@ func undeclaredDuration(r io.ReadSeeker, first frameHeader, firstPos int64) (flo
 		return float64(audioBytes) * 8 / float64(first.bitRate*1000), nil
 	}
 
-	// No candidate earned the cheap path. Walk, from the peeled end: the walk
-	// stops at the first bytes that do not decode, so an over-peel costs it
+	// No candidate earned the cheap path, so walk. Prefer the peeled end: the
+	// walk stops at the first bytes that do not decode, so an over-peel costs it
 	// nothing and an under-peel would let it wander into a trailer.
-	return walkFrameChain(r, firstPos, peeledEnd)
+	//
+	// BUT THE PEEL IS UNCORROBORATED HERE. Neither candidate passed the grid
+	// check above -- that is why this line is reached -- so nothing has confirmed
+	// the peeled end is a real trailer boundary rather than a marker that
+	// occurred in entropy-coded payload by chance. peelTrailer accepts any APE or
+	// Lyrics3v2 size satisfying total <= end, so a coincidental footer whose size
+	// field spans the stream drives peeledEnd to firstPos or below. Walking to
+	// that leaves nothing to traverse and returns (0, nil): a SILENT ZERO on a
+	// file full of audio. Reproduced before this guard -- a 20.036s VBR file with
+	// a crafted Lyrics3v2 footer read 0.000s with a nil error.
+	//
+	// A zero duration with no error is the worst available outcome: a caller
+	// cannot distinguish it from a genuinely empty stream, so it propagates as
+	// fact rather than as a failure. Fall back to the raw end when the peel
+	// leaves no audio; an unpeeled trailer at worst adds a few hundred bytes of
+	// non-decoding tail, which the walk stops at anyway.
+	walkEnd := peeledEnd
+	if walkEnd <= firstPos {
+		walkEnd = rawEnd
+	}
+	return walkFrameChain(r, firstPos, walkEnd)
 }
 
 // bytesPerFrame is the exact, fractional frame length a header's nominal bitrate

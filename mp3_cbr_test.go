@@ -476,3 +476,91 @@ func TestMp3FalseTrailerMarkersInAudioAreNotPeeled(t *testing.T) {
 		})
 	}
 }
+
+// --- CodeRabbit PR #4 findings, pinned as regression tests ---------------
+//
+// Both were REPRODUCED before being fixed; the magnitudes below are measured,
+// not estimated. Neither was caught by the existing suite nor by a 6.27M-
+// execution fuzz run, because both require a crafted TRAILER that valid sample
+// files never contain.
+
+// A crafted tail of repeated trailer markers must not turn a bounded read into
+// a whole-file read many times over. Every recognized marker shrinks the end by
+// as little as 15 bytes (a Lyrics3v2 footer whose ASCII size reads "000000"),
+// and each pass re-reads a trailerWindow tail, so an uncapped loop amplified
+// reads 34.1x -- 20,471,517 bytes for a 600,000-byte input. That defeats the
+// bounded-read guarantee this parser exists to provide.
+func TestPeelLoopIsCapped(t *testing.T) {
+	data := bytes.Repeat([]byte("000000LYRICS200"), 40000)
+
+	c := &countingReader{r: bytes.NewReader(data)}
+	if _, _, err := audioEndOffset(c); err != nil {
+		t.Fatalf("audioEndOffset: %v", err)
+	}
+
+	// Generous bound: the cap admits at most maxPeels passes of trailerWindow
+	// bytes. Anything near the input size means the loop is unbounded again.
+	const maxAllowed = 64 * 1024
+	if c.bytes > maxAllowed {
+		t.Errorf("peel loop read %d bytes for a %d-byte input (%.1fx amplification); want <= %d",
+			c.bytes, len(data), float64(c.bytes)/float64(len(data)), maxAllowed)
+	}
+}
+
+// An UNCORROBORATED peel must never yield a zero duration on a file that has
+// audio. peelTrailer accepts any APE or Lyrics3v2 size satisfying total <= end,
+// so a footer whose size field spans the stream drives the peeled end to or
+// below the first frame. Walking to that end leaves nothing to traverse and
+// returns (0, nil) -- a SILENT ZERO, the worst outcome available, since a
+// caller cannot distinguish it from a genuinely empty stream and propagates it
+// as fact. Measured before the fix: a VBR stream read 0.000s with a nil error.
+//
+// The fixture must be VBR WITHOUT a Xing header: a declared-duration file never
+// reaches undeclaredDuration and a CBR file takes the grid fast path, so both
+// would make this test vacuous. Two earlier reproduction attempts failed for
+// exactly that reason.
+func TestOverPeelDoesNotSilentlyZero(t *testing.T) {
+	// SMALL ON PURPOSE. A Lyrics3v2 size field is 6 ASCII digits, so it cannot
+	// claim more than 999,999 bytes. The 12,000-frame fixture used elsewhere in
+	// this file is ~8.8 MB, where the claimed size lands far above the first
+	// frame and the over-peel never occurs -- the test would pass against the
+	// unfixed code, which is exactly what it did before this was noticed.
+	const frames = 300
+	audio := makeVBRFrames(vbrSpecs, frames)
+	if len(audio) > 999999 {
+		t.Fatalf("fixture is %d bytes; a 6-digit Lyrics3 size cannot span it, so the test would be vacuous", len(audio))
+	}
+
+	clean, err := Mp3(bytes.NewReader(audio))
+	if err != nil {
+		t.Fatalf("clean parse: %v", err)
+	}
+	if clean <= 0 {
+		t.Fatalf("fixture reports %.3f; the test would be vacuous", clean)
+	}
+
+	crafted := appendLyrics3Footer(audio, len(audio))
+
+	got, err := Mp3(bytes.NewReader(crafted))
+	if err != nil {
+		// An error is an acceptable outcome here; a silent zero is not.
+		return
+	}
+	if got == 0 {
+		t.Fatalf("silent zero: crafted trailer yielded 0 with a nil error (clean stream reads %.3f)", clean)
+	}
+	if got < clean*0.9 {
+		t.Errorf("crafted trailer truncated the duration to %.3f, want ~%.3f", got, clean)
+	}
+}
+
+// appendLyrics3Footer appends a Lyrics3v2 footer whose 6-digit ASCII size field
+// claims size bytes -- a footer asserting the entire preceding stream is tag.
+func appendLyrics3Footer(audio []byte, size int) []byte {
+	digits := make([]byte, 6)
+	for i, s := 5, size; i >= 0; i, s = i-1, s/10 {
+		digits[i] = byte('0' + s%10)
+	}
+	out := append(append([]byte{}, audio...), digits...)
+	return append(out, []byte("LYRICS200")...)
+}
