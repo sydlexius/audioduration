@@ -16,7 +16,9 @@ jobs:
     name: Analyze Go
     runs-on: ubuntu-latest
     permissions:
+      # Uploads the CodeQL SARIF results to code scanning.
       security-events: write
+      # Checks out the source this analysis compiles and scans.
       contents: read
 
     steps:
@@ -46,9 +48,15 @@ jobs:
   # Second CodeQL language: `actions` scans the workflow files themselves for
   # script injection, unpinned/mutable action refs and over-broad permissions.
   # It is a distinct analysis from `go` -- the Go job says nothing about the 10
-  # workflows in this repo, several of which use `pull_request_target` (which
-  # runs with a privileged token against untrusted PR head code, so an injection
-  # there is the highest-severity workflow bug available).
+  # workflow files in this repo.
+  #
+  # Two of those (pr-labels.yml, pr-milestone.yml) run on `pull_request_target`,
+  # which grants a write-capable token in the base-repo context. That trigger is
+  # not by itself an execution risk: neither workflow checks out PR head code,
+  # and both only call actions/github-script against the API. The exposure would
+  # arise from checking out or executing untrusted head code while holding that
+  # token, or from interpolating attacker-controlled PR fields into a script.
+  # This analysis is what would catch either if one were introduced later.
   #
   # No conditional skip: `build-mode: none` means there is nothing to compile,
   # so the job costs roughly a minute and always running it keeps the required
@@ -57,7 +65,9 @@ jobs:
     name: Analyze Actions
     runs-on: ubuntu-latest
     permissions:
+      # Uploads the CodeQL SARIF results to code scanning.
       security-events: write
+      # Checks out the workflow files this analysis reads.
       contents: read
 
     steps:
