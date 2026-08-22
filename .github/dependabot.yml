@@ -5,6 +5,12 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Hold a new release for 7 days before opening a version-update PR, so a
+    # release that gets yanked or hot-patched in its first week never costs a
+    # review cycle. Security updates are alert-driven and ignore cooldown, so
+    # this delays churn without delaying a CVE fix.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore(deps)"
     labels:
@@ -16,17 +22,30 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
     labels:
       - dependencies
       - ci
     open-pull-requests-limit: 5
+    # Sub-actions of one repo share a commit SHA, but Dependabot names each
+    # subpath as its own dependency and will happily bump one and not the rest.
+    # These groups force a single PR per family so the pins cannot drift apart.
+    #
+    # codeql-action is the family that already broke elsewhere: init writes a
+    # config file stamped with its own version, and a stale analyze refuses to
+    # load it ("Loaded a configuration file for version X, but running version
+    # Y"), failing every CodeQL job. The pattern is deliberately unanchored
+    # after the repo name so a bare "github/codeql-action" is captured too, not
+    # only the "/init", "/analyze" and "/upload-sarif" subpaths.
     groups:
-      # CodeQL sub-actions (init/analyze/autobuild) cross-check versions at
-      # runtime and must move in lockstep; group them so a bump never splits
-      # init and analyze across separate PRs (which fails with a config
-      # version-mismatch error).
       codeql-action:
         patterns:
-          - "github/codeql-action/*"
+          - "github/codeql-action*"
+      # Only actions/cache itself is used today, but its "/restore" and "/save"
+      # subpaths are exposed to the identical split; group it pre-emptively.
+      actions-cache:
+        patterns:
+          - "actions/cache*"
