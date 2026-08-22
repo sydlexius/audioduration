@@ -42,3 +42,37 @@ jobs:
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           category: "/language:go"
+
+  # Second CodeQL language: `actions` scans the workflow files themselves for
+  # script injection, unpinned/mutable action refs and over-broad permissions.
+  # It is a distinct analysis from `go` -- the Go job says nothing about the 10
+  # workflows in this repo, several of which use `pull_request_target` (which
+  # runs with a privileged token against untrusted PR head code, so an injection
+  # there is the highest-severity workflow bug available).
+  #
+  # No conditional skip: `build-mode: none` means there is nothing to compile,
+  # so the job costs roughly a minute and always running it keeps the required
+  # status check honest -- a check that is sometimes absent cannot be required.
+  analyze-actions:
+    name: Analyze Actions
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: actions
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: "/language:actions"
