@@ -102,8 +102,9 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Pinned to match canticle's own govulncheck pin.
+      # v1.1.4's vendored x/tools SSA builder panics ("unexpected expr") on
+      # go1.27 code; v1.9.0 is validated clean against go 1.27.3.
       - name: Run govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           govulncheck ./...
