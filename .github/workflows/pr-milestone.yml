@@ -1,7 +1,14 @@
 # Automatically assign a milestone to PRs based on the issues they reference.
 # Parses "Fixes #N", "Closes #N", "Resolves #N", and "Part of #N" from the PR
 # body, looks up each issue's milestone, and assigns the first one found.
-# Warns via comment if referenced issues have conflicting milestones.
+# Warns via comment if referenced issues have conflicting milestones. Every
+# run keeps that note in step with the current references: it is posted or
+# updated while they span milestones and deleted once they no longer do (one
+# milestone, none, or no references), so an edited PR never keeps a stale note.
+#
+# PR comments are untrusted: the note is found by its sentinel AND by its
+# author being github-actions[bot], so a planted sentinel in someone else's
+# comment is never updated or deleted. Comments are read with pagination.
 #
 # Ported from sydlexius/stillwater's pr-milestone.yml. Canticle organizes its
 # backlog into domain milestones (Instrumental Detection, Word-Sync & Generation,
@@ -51,12 +58,9 @@ jobs:
               }
             }
 
-            if (issueNumbers.length === 0) {
-              core.info('No issue references found in PR body, skipping');
-              return;
-            }
-
-            core.info(`Found issue references: ${issueNumbers.map(n => '#' + n).join(', ')}`);
+            core.info(issueNumbers.length > 0
+              ? `Found issue references: ${issueNumbers.map(n => '#' + n).join(', ')}`
+              : 'No issue references found in PR body');
 
             // Look up milestones for each referenced issue
             const milestones = new Map();
@@ -83,17 +87,23 @@ jobs:
               }
             }
 
-            if (milestones.size === 0) {
-              core.info('No referenced issues have milestones, skipping');
-              return;
-            }
-
             const entries = Array.from(milestones.values());
             const target = entries[0];
 
-            // Warn if issues reference conflicting milestones (upsert to avoid spam)
+            // Find our conflict note on every run, so it can be updated or deleted.
+            // The sentinel is plain text a PR author could paste into their own
+            // comment, so it also requires the author to be this workflow's bot.
+            const sentinel = '<!-- pr-milestone-conflict -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(sentinel)
+              && c.user && c.user.type === 'Bot' && c.user.login === 'github-actions[bot]');
+
             if (milestones.size > 1) {
-              const sentinel = '<!-- pr-milestone-conflict -->';
               const list = entries
                 .map(m => `- **${m.title}** (from ${m.issues.map(n => '#' + n).join(', ')})`)
                 .join('\n');
@@ -106,14 +116,6 @@ jobs:
                 `Auto-assigned the milestone from the first match: **${target.title}**.`,
                 'Update manually if this is incorrect.',
               ].join('\n');
-
-              // Find existing warning comment to update instead of creating a new one
-              const comments = await github.rest.issues.listComments({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr.number,
-              });
-              const existing = comments.data.find(c => c.body && c.body.includes(sentinel));
 
               if (existing) {
                 await github.rest.issues.updateComment({
@@ -133,6 +135,18 @@ jobs:
               }
 
               core.warning(`Conflicting milestones detected, assigned "${target.title}"`);
+            } else if (existing) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+              });
+              core.info('Deleted the conflict note: the references no longer span milestones');
+            }
+
+            if (!target) {
+              core.info('No referenced issue has a milestone, nothing to assign');
+              return;
             }
 
             // Only auto-assign when the PR has no milestone; respect manual choices
