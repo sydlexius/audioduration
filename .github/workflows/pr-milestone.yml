@@ -180,6 +180,13 @@ jobs:
               core.info('Deleted the conflict note: the references no longer span milestones');
             }
 
+            // With part of the references unread, the first one's milestone is
+            // unknown, so assigning from the rest could pick the wrong milestone.
+            if (incomplete) {
+              core.warning('Not assigning a milestone: not every referenced issue was read.');
+              return;
+            }
+
             if (!target) {
               core.info('No referenced issue has a milestone, nothing to assign');
               return;
